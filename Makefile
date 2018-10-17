@@ -34,6 +34,9 @@ else
 	@exit 1
 endif
 
+test:
+	go test ./cmd/... -coverprofile cover.out
+
 clean:
 	go clean
 
