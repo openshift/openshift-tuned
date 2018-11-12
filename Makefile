@@ -1,4 +1,4 @@
-PROGRAM=tuned-wait
+PROGRAM=openshift-tuned
 SRC_DIR=cmd
 BIN_DIR=./
 DOCKERFILE=Dockerfile

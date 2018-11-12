@@ -2,11 +2,9 @@
 
 oc_node_labels=/var/lib/tuned/ocp-node-labels.cfg
 
-for action in stop disable ; do
-  SYSTEMD_IGNORE_CHROOT=1 systemctl $action tuned || :
-done
+SYSTEMD_IGNORE_CHROOT=1 systemctl disable tuned --now || :
 
-tuned-wait -p 8080 \
+openshift-tuned -p 8080 \
            -l $oc_node_labels \
            --watch /etc/tuned/recommend.d/ \
            --watch /var/lib/tuned/profiles-data/ \
