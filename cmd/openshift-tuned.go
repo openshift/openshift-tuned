@@ -11,6 +11,7 @@ import (
 	"net/http"  // http server
 	"os"        // os.Exit(), os.Signal, os.Stderr, ...
 	"os/exec"   // os.Exec()
+	"reflect"   // reflect.DeepEqual()
 	"strconv"   // strconv
 	"strings"   // strings.Join()
 	"time"      // time.Sleep()
@@ -23,27 +24,28 @@ import (
 	"k8s.io/client-go/rest"
 )
 
-/* Types */
+// Types
 type arrayFlags []string
 
-/* Constants */
+// Constants
 const (
 	resyncPeriodDefault    = 60
-	PNAME                  = "tuned-wait"
+	PNAME                  = "openshift-tuned"
 	tunedActiveProfileFile = "/etc/tuned/active_profile"
 	tunedProfilesConfigMap = "/var/lib/tuned/profiles-data/tuned-profiles.yaml"
 	tunedProfilesDir       = "/etc/tuned"
 )
 
-/* Global variables */
+// Global variables
 var (
-	boolDumpNodeLabels = flag.Bool("dump-node-labels", false, "dump node labels and exit")
-	fileNodeLabels     = "/var/lib/tuned/ocp-node-labels.cfg"
-	fileWatch          arrayFlags
-	apiPort            = flag.Int("p", 0, "port to listen on for API requests, 0 disables the functionality")
+	boolDumpLabels = flag.Bool("dump-labels", false, "dump node/pod labels and exit")
+	fileNodeLabels = "/var/lib/tuned/ocp-node-labels.cfg"
+	filePodLabels  = "/var/lib/tuned/ocp-pod-labels.cfg"
+	fileWatch      arrayFlags
+	apiPort        = flag.Int("p", 0, "port to listen on for API requests, 0 disables the functionality")
 )
 
-/* Functions */
+// Functions
 func mkdir(dir string) error {
 	if _, err := os.Stat(dir); os.IsNotExist(err) {
 		err = os.MkdirAll(dir, os.ModePerm)
@@ -74,8 +76,24 @@ func parseCmdOpts() {
 	}
 
 	flag.Var(&fileWatch, "watch", "Files/directories to watch for changes.")
-	flag.StringVar(&fileNodeLabels, "l", fileNodeLabels, "File to dump node-labels to for tuned.")
+	flag.StringVar(&fileNodeLabels, "node-labels", fileNodeLabels, "File to dump node-labels to for tuned.")
+	flag.StringVar(&filePodLabels, "pod-labels", filePodLabels, "File to dump pod-labels to for tuned.")
 	flag.Parse()
+}
+
+// Insert only unique strings to `array' in alphabetical order
+func insertUnique(array []string, s string) []string {
+	for i, val := range array {
+		if val == s {
+			return array
+		}
+		if val > s {
+			copy(array[i+1:], array[i:])
+			array[i] = s
+			return array
+		}
+	}
+	return append(array, s)
 }
 
 func profilesExtract() {
@@ -128,33 +146,53 @@ func tunedReload() {
 	}
 }
 
-func nodeLabelsGet(clientset *kubernetes.Clientset, nodeName string) (nodeLabels map[string]string) {
+func nodeLabelsGet(clientset *kubernetes.Clientset, nodeName string) map[string][]string {
 	node, err := clientset.CoreV1().Nodes().Get(nodeName, metav1.GetOptions{})
-	if err != nil {
-		panic(err.Error())
-	}
 	if errors.IsNotFound(err) {
 		log.Printf("%s: node %s not found\n", PNAME, nodeName)
 	} else if statusError, isStatus := err.(*errors.StatusError); isStatus {
 		log.Printf("%s: error getting node %v\n", PNAME, statusError.ErrStatus.Message)
-	} else if err != nil {
+	}
+	if err != nil {
 		panic(err.Error())
 	}
 
-	return node.Labels
+	// This is not strictly necessary, but be consistent with podLabelsGet and return the same type
+	nodeLabels := map[string][]string{}
+	for key, value := range node.Labels {
+		nodeLabels[key] = append(nodeLabels[key], value)
+	}
+
+	return nodeLabels
 }
 
-func nodeLabelsRead() map[string]string {
-	nodeLabels := make(map[string]string)
+func podLabelsGet(clientset *kubernetes.Clientset, nodeName string) map[string][]string {
+	pods, err := clientset.CoreV1().Pods("").List(metav1.ListOptions{FieldSelector: "spec.nodeName=" + nodeName})
+	if err != nil {
+		panic(err.Error())
+	}
 
-	if _, err := os.Stat(fileNodeLabels); os.IsNotExist(err) {
-		/* node labels file does not exist */
+	podLabels := map[string][]string{}
+	for _, pod := range pods.Items {
+		for key, value := range pod.GetLabels() {
+			podLabels[key] = insertUnique(podLabels[key], value)
+		}
+	}
+
+	return podLabels
+}
+
+func labelsRead(fileLabels string) map[string][]string {
+	var labels = map[string][]string{}
+
+	if _, err := os.Stat(fileLabels); os.IsNotExist(err) {
+		// labels file does not exist
 		return nil
 	}
 
-	f, err := os.Open(fileNodeLabels)
+	f, err := os.Open(fileLabels)
 	if err != nil {
-		log.Fatalf("Error opening node labels file %s: %v\n", fileNodeLabels, err)
+		log.Fatalf("Error opening labels file %s: %v\n", fileLabels, err)
 	}
 	defer f.Close()
 
@@ -164,51 +202,58 @@ func nodeLabelsRead() map[string]string {
 		if equal := strings.Index(line, "="); equal >= 0 {
 			if key := strings.TrimSpace(line[:equal]); len(key) > 0 {
 				value := line[equal+1:]
-				nodeLabels[key] = value
+				labels[key] = insertUnique(labels[key], value)
 			}
 		} else {
-			/* no '=' sign found */
-			log.Fatalf("Invalid key=value pair in node labels file %s: %s\n", fileNodeLabels, line)
+			// no '=' sign found
+			log.Fatalf("Invalid key=value pair in labels file %s: %s\n", fileLabels, line)
 		}
 	}
+	//
 
-	return nodeLabels
+	return labels
 }
 
-func nodeLabelsDump(nodeLabels map[string]string) {
-	f, err := os.Create(fileNodeLabels)
+func labelsDump(labels map[string][]string, fileLabels string) {
+	f, err := os.Create(fileLabels)
 	if err != nil {
 	}
 	defer f.Close()
 
-	for key, value := range nodeLabels {
-		_, err := f.WriteString(fmt.Sprintf("%s=%s\n", key, value))
-		if err != nil {
-			log.Fatalf("Error writing to node labels file %s: %v\n", fileNodeLabels, err)
+	log.Printf("%s: dumping labels to %s\n", PNAME, fileLabels)
+	for key, values := range labels {
+		for _, value := range values {
+			_, err := f.WriteString(fmt.Sprintf("%s=%s\n", key, value))
+			if err != nil {
+				log.Fatalf("Error writing to labels file %s: %v\n", fileLabels, err)
+			}
 		}
 	}
 	f.Sync()
 }
 
-func nodeLabelsCompare(nodeLabelsOld map[string]string, nodeLabelsNew map[string]string) bool {
-	if nodeLabelsOld == nil {
-		/* no node labels defined yet */
+func labelsCompare(labelsOld map[string][]string, labelsNew map[string][]string, labelType string, fileLabels string) bool {
+	if labelsOld == nil {
+		// no labels defined yet
 		return false
 	}
-	if len(nodeLabelsOld) != len(nodeLabelsNew) {
-		log.Printf("%s: node labels changed\n", PNAME)
-		nodeLabelsDump(nodeLabelsNew)
+	if len(labelsOld) != len(labelsNew) {
+		log.Printf("%s: %s labels changed\n", PNAME, labelType)
+		labelsDump(labelsNew, fileLabels)
 		tunedReload()
 		return false
 	}
-	for key, value := range nodeLabelsNew {
-		if nodeLabelsOld[key] != value {
-			log.Printf("%s: node label[%s] == %s (old value: %s)\n", PNAME, key, value, nodeLabelsOld[key])
-			nodeLabelsDump(nodeLabelsNew)
+	for key, value := range labelsNew {
+		// No need to sort labelsOld[key] and value, already sorted when reading/adding label values
+		if !reflect.DeepEqual(labelsOld[key], value) {
+			log.Printf("%s: label[%s] == %v (old value: %v)\n", PNAME, key, value, labelsOld[key])
+			labelsDump(labelsNew, fileLabels)
 			tunedReload()
 			return false
 		}
 	}
+
+	log.Printf("%s: %s labels match\n", PNAME, labelType)
 	return true
 }
 
@@ -239,7 +284,8 @@ func apiActiveProfile(w http.ResponseWriter, req *http.Request) {
 }
 
 func mainLoop(clientset *kubernetes.Clientset, nodeName string, resyncPeriodDuration int64) {
-	nodeLabelsOld := nodeLabelsRead()
+	nodeLabelsOld := labelsRead(fileNodeLabels)
+	podLabelsOld := labelsRead(filePodLabels)
 
 	if *apiPort > 0 {
 		go func() {
@@ -253,9 +299,15 @@ func mainLoop(clientset *kubernetes.Clientset, nodeName string, resyncPeriodDura
 	ticker := time.NewTicker(time.Second * time.Duration(resyncPeriodDuration))
 	go func() {
 		for range ticker.C {
+			// Compare node labels
 			nodeLabels := nodeLabelsGet(clientset, nodeName)
-			nodeLabelsCompare(nodeLabelsOld, nodeLabels)
+			labelsCompare(nodeLabelsOld, nodeLabels, "node", fileNodeLabels)
 			nodeLabelsOld = nodeLabels
+
+			// Compare pod labels
+			podLabels := podLabelsGet(clientset, nodeName)
+			labelsCompare(podLabelsOld, podLabels, "pod", filePodLabels)
+			podLabelsOld = podLabels
 		}
 	}()
 
@@ -271,7 +323,7 @@ func mainLoop(clientset *kubernetes.Clientset, nodeName string, resyncPeriodDura
 			select {
 			case event := <-watcher.Events:
 				log.Printf("%s: event: %v\n", PNAME, event)
-				/* Ignore Write and Create events, wait for the removal of the old ConfigMap */
+				// Ignore Write and Create events, wait for the removal of the old ConfigMap
 				if event.Op&fsnotify.Remove == fsnotify.Remove {
 					log.Printf("%s: modified file: %s\n", PNAME, event.Name)
 					profilesExtract()
@@ -321,8 +373,9 @@ func main() {
 	}
 
 	profilesExtract()
-	nodeLabelsDump(nodeLabelsGet(clientset, nodeName))
-	if *boolDumpNodeLabels {
+	labelsDump(nodeLabelsGet(clientset, nodeName), fileNodeLabels)
+	labelsDump(podLabelsGet(clientset, nodeName), filePodLabels)
+	if *boolDumpLabels {
 		os.Exit(0)
 	}
 	tunedReload()
