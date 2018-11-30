@@ -1,11 +1,13 @@
 #!/bin/sh
 
-oc_node_labels=/var/lib/tuned/ocp-node-labels.cfg
+cluster_node_labels=${CLUSTER_NODE_LABELS:-/var/lib/tuned/ocp-node-labels.cfg}
+cluster_pod_labels=${CLUSTER_POD_LABELS:-/var/lib/tuned/ocp-pod-labels.cfg}
 
 SYSTEMD_IGNORE_CHROOT=1 systemctl disable tuned --now || :
 
 openshift-tuned -p 8080 \
-           -l $oc_node_labels \
-           --watch /etc/tuned/recommend.d/ \
-           --watch /var/lib/tuned/profiles-data/ \
+           -node-labels $cluster_node_labels \
+           -pod-labels $cluster_pod_labels \
+           -watch-file /etc/tuned/recommend.d/ \
+           -watch-file /var/lib/tuned/profiles-data/ \
            ${OCP_NODE_NAME}
