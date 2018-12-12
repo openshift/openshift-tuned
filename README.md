@@ -5,10 +5,11 @@ daemon for [OpenShift](https://openshift.io/).
 
 The daemon is meant to be started by the
 [cluster-node-tuning-operator](https://github.com/openshift/cluster-node-tuning-operator).
-The operator supplies configuration data to the daemon by volume-mounting ConfigMaps into 
+The operator supplies configuration data to the daemon by volume-mounting ConfigMaps into
 the container.
 
-The tuned pod uses inotify events to catch ConfigMap changes and
-reloads the profiles based on a newly recommended profile.  Node label
-changes are listened to by using a pull model by querying OpenShift
-API server to fetch node labels.
+The tuned pod:
+  - watches for inotify events to catch changes to the profile and tuned sections of the `recommend.conf` ConfigMap.
+  - watches for node and pod label changes of all pods running on the node that the tuned pod runs on.
+
+A "recommended" tuned profile is (re-)applied based on the changes above.
