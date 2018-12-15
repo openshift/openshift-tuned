@@ -5,11 +5,12 @@ DOCKERFILE=Dockerfile
 IMAGE_TAG=openshift/openshift-tuned
 IMAGE_REGISTRY=docker.io
 GOFMT_CHECK=$(shell find . -not \( \( -wholename './.*' -o -wholename '*/vendor/*' \) -prune \) -name '*.go' | sort -u | xargs gofmt -s -l)
+REV=$(shell git describe --long --tags --match='v*' --always --dirty)
 
 all: $(BIN_DIR)/$(PROGRAM)
 
 $(BIN_DIR)/$(PROGRAM) build: $(SRC_DIR)/$(PROGRAM).go
-	go build -o $(BIN_DIR)/$(PROGRAM) $<
+	go build -o $(BIN_DIR)/$(PROGRAM) -ldflags '-X main.version=$(REV)' $<
 
 run: $(SRC_DIR)/$(PROGRAM).go
 	go run $<
