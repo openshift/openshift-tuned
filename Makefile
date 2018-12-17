@@ -3,7 +3,7 @@ SRC_DIR=cmd
 BIN_DIR=./
 DOCKERFILE=Dockerfile
 IMAGE_TAG=openshift/openshift-tuned
-IMAGE_REGISTRY=docker.io
+IMAGE_REGISTRY=quay.io
 GOFMT_CHECK=$(shell find . -not \( \( -wholename './.*' -o -wholename '*/vendor/*' \) -prune \) -name '*.go' | sort -u | xargs gofmt -s -l)
 REV=$(shell git describe --long --tags --match='v*' --always --dirty)
 
@@ -40,15 +40,21 @@ test:
 
 clean:
 	go clean
+	rm -f $(BIN)
 
 local-image:
 ifdef USE_BUILDAH
 	buildah bud -t $(IMAGE_TAG) -f $(DOCKERFILE) .
 else
-	docker build -t $(IMAGE_TAG) -f $(DOCKERFILE) .
+	sudo docker build -t $(IMAGE_TAG) -f $(DOCKERFILE) .
 endif
 
 local-image-push:
-	buildah push $(IMAGE_TAG) $(IMAGE_REGISTRY)/$(IMAGE_TAG)
+ifdef USE_BUILDAH
+	buildah push $(BUILDAH_OPTS) $(IMAGE_TAG) $(IMAGE_REGISTRY)/$(IMAGE_TAG)
+else
+	sudo docker tag $(IMAGE_TAG) $(IMAGE_REGISTRY)/$(IMAGE_TAG)
+	sudo docker push $(IMAGE_REGISTRY)/$(IMAGE_TAG)
+endif
 
 .PHONY: all build run fmt format vet strip clean local-image local-image-push
