@@ -279,7 +279,10 @@ func podWatch(clientset *kubernetes.Clientset, nodeName string) watch.Interface 
 }
 
 func nodeChangeHandler(event watch.Event, tuned *tunedState) {
-	node := event.Object.(*corev1.Node)
+	node, ok := event.Object.(*corev1.Node)
+	if !ok {
+		log.Fatalf("unexpected object received: %#v", event.Object)
+	}
 
 	if !reflect.DeepEqual(node.Labels, tuned.nodeLabels) {
 		// Node labels changed
@@ -296,7 +299,11 @@ func nodeChangeHandler(event watch.Event, tuned *tunedState) {
 // labels of other pods running on the same node may already have the same labels.
 func podChangeHandler(event watch.Event, tuned *tunedState) {
 	var sb strings.Builder
-	pod := event.Object.(*corev1.Pod)
+	pod, ok := event.Object.(*corev1.Pod)
+	if !ok {
+		log.Fatalf("Unexpected object received: %#v", event.Object)
+	}
+
 	sb.WriteString(pod.Namespace)
 	sb.WriteString("/")
 	sb.WriteString(pod.Name)
@@ -437,10 +444,16 @@ func mainLoop(clientset *kubernetes.Clientset, nodeName string) {
 		case err := <-wFs.Errors:
 			log.Printf("Error watching filesystem: %v", err)
 
-		case nodeEvent := <-wNode.ResultChan():
+		case nodeEvent, ok := <-wNode.ResultChan():
+			if !ok {
+				log.Fatalf("Node event watch channel closed.")
+			}
 			nodeChangeHandler(nodeEvent, &tuned)
 
-		case podEvent := <-wPod.ResultChan():
+		case podEvent, ok := <-wPod.ResultChan():
+			if !ok {
+				log.Fatalf("Pod event watch channel closed.")
+			}
 			podChangeHandler(podEvent, &tuned)
 
 		case <-tickerPull.C:
