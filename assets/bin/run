@@ -5,6 +5,13 @@ cluster_pod_labels=${CLUSTER_POD_LABELS:-/var/lib/tuned/ocp-pod-labels.cfg}
 
 SYSTEMD_IGNORE_CHROOT=1 systemctl disable tuned --now || :
 
+# Tuned can take ~20s to reload/start when "ulimit -Sn == 1048576".
+# See:
+# - https://github.com/redhat-performance/tuned/issues/146
+# - https://www.python.org/dev/peps/pep-0446/#closing-all-open-file-descriptors
+# - http://bugs.python.org/issue1663329
+ulimit -Sn 1024	# workaround for the issue above
+
 openshift-tuned \
            -node-labels $cluster_node_labels \
            -pod-labels $cluster_pod_labels \
