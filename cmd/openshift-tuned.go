@@ -407,11 +407,28 @@ func pullResyncPeriod() int64 {
 	return resyncPeriodDuration
 }
 
-func mainLoop(clientset *kubernetes.Clientset, nodeName string) (err error) {
+func changeWatcher() (err error) {
 	var (
 		tuned tunedState
 		wPod  watch.Interface
 	)
+
+	nodeName := flag.Args()[0]
+
+	err = profilesExtract()
+	if err != nil {
+		return err
+	}
+
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		return err
+	}
+
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return err
+	}
 
 	// Create a ticker to do a full node/pod labels pull
 	resyncPeriod := pullResyncPeriod()
@@ -483,15 +500,15 @@ func mainLoop(clientset *kubernetes.Clientset, nodeName string) (err error) {
 	}
 }
 
-func supervise(clientset *kubernetes.Clientset, nodeName string) (err error) {
-	var errs int = 0
+func retryLoop(f func() error) (err error) {
+	var errs int
 	const (
 		errsMax              = 5
 		errsMaxWithinSeconds = 120
 	)
 	errsTimeStart := time.Now().Unix()
 	for {
-		err = mainLoop(clientset, nodeName)
+		err = f()
 		if err == nil {
 			break
 		}
@@ -524,23 +541,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	nodeName := flag.Args()[0]
-
-	config, err := rest.InClusterConfig()
-	if err != nil {
-		panic(err.Error())
-	}
-
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		panic(err.Error())
-	}
-
-	profilesExtract()
-
 	sigs := signalHandler()
-
-	err = supervise(clientset, nodeName)
+	err := retryLoop(changeWatcher)
 	signal.Stop(sigs)
 	if err != nil {
 		panic(err.Error())
