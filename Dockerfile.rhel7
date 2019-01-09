@@ -11,7 +11,7 @@ WORKDIR ${APP_ROOT}
 COPY --from=builder /go/src/github.com/openshift/openshift-tuned/openshift-tuned /usr/bin/
 COPY --from=builder /go/src/github.com/openshift/openshift-tuned/assets ${APP_ROOT}
 RUN INSTALL_PKGS=" \
-      tuned kernel-tools patch \
+      tuned hdparm kernel-tools patch \
       " && \
     yum install --setopt=tsflags=nodocs -y $INSTALL_PKGS && \
     rpm -V $INSTALL_PKGS && \
