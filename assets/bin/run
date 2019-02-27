@@ -13,6 +13,7 @@ SYSTEMD_IGNORE_CHROOT=1 systemctl disable tuned --now || :
 ulimit -Sn 1024	# workaround for the issue above
 
 openshift-tuned \
+           -v=1 \
            -node-labels $cluster_node_labels \
            -pod-labels $cluster_pod_labels \
            -watch-file /etc/tuned/recommend.d/ \
