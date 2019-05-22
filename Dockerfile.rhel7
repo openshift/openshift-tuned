@@ -5,7 +5,7 @@ RUN make build
 
 FROM registry.svc.ci.openshift.org/ocp/4.0:base
 ENV APP_ROOT=/var/lib/tuned
-ENV PATH=${APP_ROOT}/bin:${PATH} 
+ENV PATH=${APP_ROOT}/bin:${PATH}
 ENV HOME=${APP_ROOT}
 WORKDIR ${APP_ROOT}
 COPY --from=builder /go/src/github.com/openshift/openshift-tuned/openshift-tuned /usr/bin/
@@ -15,8 +15,7 @@ RUN INSTALL_PKGS=" \
       " && \
     yum install --setopt=tsflags=nodocs -y $INSTALL_PKGS && \
     rpm -V $INSTALL_PKGS && \
-    (patch -p1 -d /usr/lib/python*/site-packages/tuned/daemon/ < patches/tuned.diff || :) && \ 
-    sed -i 's/^\s*daemon.*$/daemon = 0/' /etc/tuned/tuned-main.conf && \
+    (LC_COLLATE=C cat patches/*.diff | patch -p1 -d /usr/lib/python*/site-packages/tuned/ || :) && \
     touch /etc/sysctl.conf && \
     yum -y remove patch && \
     yum clean all && \

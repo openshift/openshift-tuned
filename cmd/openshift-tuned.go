@@ -57,20 +57,25 @@ const (
 	sleepRetry          = 5
 	// Minimum interval between writing changed node/pod labels for tuned daemon in [s]
 	labelDumpInterval      = 5
-	PNAME                  = "openshift-tuned"
+	programName            = "openshift-tuned"
 	tunedActiveProfileFile = "/etc/tuned/active_profile"
+	tunedDaemonPidFile     = "/run/tuned/tuned.pid"
 	tunedProfilesConfigMap = "/var/lib/tuned/profiles-data/tuned-profiles.yaml"
 	tunedProfilesDir       = "/etc/tuned"
+	openshiftTunedRunDir   = "/run/" + programName
+	openshiftTunedPidFile  = openshiftTunedRunDir + "/" + programName + ".pid"
 )
 
 // Global variables
 var (
 	done               = make(chan bool, 1)
+	tuned_exit         = make(chan bool, 1)
 	terminationSignals = []os.Signal{syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT}
 	fileNodeLabels     = "/var/lib/tuned/ocp-node-labels.cfg"
 	filePodLabels      = "/var/lib/tuned/ocp-pod-labels.cfg"
 	fileWatch          arrayFlags
-	version            string // PNAME version
+	version            string // programName version
+	cmd                *exec.Cmd
 	// Flags
 	boolVersion = flag.Bool("version", false, "show program version and exit")
 )
@@ -98,8 +103,8 @@ func (a *arrayFlags) Set(value string) error {
 
 func parseCmdOpts() {
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [options] <NODE>\n", PNAME)
-		fmt.Fprintf(os.Stderr, "Example: %s b1.lan\n\n", PNAME)
+		fmt.Fprintf(os.Stderr, "Usage: %s [options] <NODE>\n", programName)
+		fmt.Fprintf(os.Stderr, "Example: %s b1.lan\n\n", programName)
 		fmt.Fprintf(os.Stderr, "Options:\n")
 
 		flag.PrintDefaults()
@@ -191,8 +196,7 @@ func profilesExtract() error {
 		profileDir := fmt.Sprintf("%s/%s", tunedProfilesDir, key)
 		profileFile := fmt.Sprintf("%s/%s", profileDir, "tuned.conf")
 
-		err = mkdir(profileDir)
-		if err != nil {
+		if err = mkdir(profileDir); err != nil {
 			return fmt.Errorf("Failed to create tuned profile directory '%s': %v", profileDir, err)
 		}
 
@@ -201,24 +205,109 @@ func profilesExtract() error {
 			return fmt.Errorf("Failed to create tuned profile file '%s': %v", profileFile, err)
 		}
 		defer f.Close()
-		_, err = f.WriteString(value)
-		if err != nil {
+		if _, err = f.WriteString(value); err != nil {
 			return fmt.Errorf("Failed to write tuned profile file '%s': %v", profileFile, err)
 		}
 	}
 	return nil
 }
 
+func openshiftTunedPidFileWrite() error {
+	if err := mkdir(openshiftTunedRunDir); err != nil {
+		return fmt.Errorf("Failed to create %s run directory '%s': %v", programName, openshiftTunedRunDir, err)
+	}
+	f, err := os.Create(openshiftTunedPidFile)
+	if err != nil {
+		return fmt.Errorf("Failed to create openshift-tuned pid file '%s': %v", openshiftTunedPidFile, err)
+	}
+	defer f.Close()
+	if _, err = f.WriteString(strconv.Itoa(os.Getpid())); err != nil {
+		return fmt.Errorf("Failed to write openshift-tuned pid file '%s': %v", openshiftTunedPidFile, err)
+	}
+	return nil
+}
+
+func tunedCreateCmd() *exec.Cmd {
+	return exec.Command("/usr/sbin/tuned", "--no-dbus")
+}
+
+func tunedRun() {
+	glog.Infof("Starting tuned...")
+
+	defer func() {
+		tuned_exit <- true
+	}()
+
+	cmdReader, err := cmd.StderrPipe()
+	if err != nil {
+		glog.Errorf("Error creating StderrPipe for tuned: %v", err)
+		return
+	}
+
+	scanner := bufio.NewScanner(cmdReader)
+	go func() {
+		for scanner.Scan() {
+			fmt.Printf("%s\n", scanner.Text())
+		}
+	}()
+
+	err = cmd.Start()
+	if err != nil {
+		glog.Errorf("Error starting tuned: %v", err)
+		return
+	}
+
+	err = cmd.Wait()
+	if err != nil {
+		// The command exited with non 0 exit status, e.g. terminated by a signal
+		glog.Errorf("Error waiting for tuned: %v", err)
+		return
+	}
+
+	return
+}
+
+func tunedStop() error {
+	if cmd == nil {
+		// Looks like there has been a termination signal prior to starting tuned
+		return nil
+	}
+	if cmd.Process != nil {
+		glog.V(1).Infof("Sending TERM to PID %d", cmd.Process.Pid)
+		cmd.Process.Signal(syscall.SIGTERM)
+	} else {
+		// This should never happen
+		return fmt.Errorf("Cannot find the tuned process!")
+	}
+	// Wait for tuned process to stop -- this will enable node-level tuning rollback
+	<-tuned_exit
+	glog.V(1).Infof("Tuned process terminated")
+
+	return nil
+}
+
 func tunedReload() error {
-	var stdout, stderr bytes.Buffer
+	if cmd == nil {
+		// Tuned hasn't been started by openshift-tuned, start it
+		cmd = tunedCreateCmd()
+		go tunedRun()
+		return nil
+	}
 
 	glog.Infof("Reloading tuned...")
-	cmd := exec.Command("/usr/sbin/tuned", "--no-dbus")
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	fmt.Fprintf(os.Stderr, "%s", stderr.String()) // do not use glog.Infof(), tuned has its own timestamping
-	return err
+
+	if cmd.Process != nil {
+		glog.Infof("Sending HUP to PID %d", cmd.Process.Pid)
+		err := cmd.Process.Signal(syscall.SIGHUP)
+		if err != nil {
+			return fmt.Errorf("Error sending SIGHUP to PID %d: %v\n", cmd.Process.Pid, err)
+		}
+	} else {
+		// This should never happen
+		return fmt.Errorf("Cannot find the tuned process!")
+	}
+
+	return nil
 }
 
 func nodeLabelsGet(clientset *kubernetes.Clientset, nodeName string) (map[string]string, error) {
@@ -628,8 +717,16 @@ func changeWatcher() (err error) {
 	for {
 		select {
 		case <-done:
+			// Termination signal received, stop
 			glog.V(2).Infof("changeWatcher done")
+			if err := tunedStop(); err != nil {
+				glog.Errorf("%s", err.Error())
+			}
 			return nil
+
+		case <-tuned_exit:
+			cmd = nil // cmd.Start() cannot be used more than once
+			return fmt.Errorf("Tuned process exitted")
 
 		case fsEvent := <-wFs.Events:
 			glog.V(2).Infof("fsEvent")
@@ -704,7 +801,7 @@ func main() {
 	logsCoexist()
 
 	if *boolVersion {
-		fmt.Fprintf(os.Stderr, "%s %s\n", PNAME, version)
+		fmt.Fprintf(os.Stderr, "%s %s\n", programName, version)
 		os.Exit(0)
 	}
 
@@ -713,8 +810,13 @@ func main() {
 		os.Exit(1)
 	}
 
+	err := openshiftTunedPidFileWrite()
+	if err != nil {
+		panic(err.Error())
+	}
+
 	sigs := signalHandler()
-	err := retryLoop(changeWatcher)
+	err = retryLoop(changeWatcher)
 	signal.Stop(sigs)
 	if err != nil {
 		panic(err.Error())
