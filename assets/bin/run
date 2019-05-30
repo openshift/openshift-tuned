@@ -2,20 +2,36 @@
 
 cluster_node_labels=${CLUSTER_NODE_LABELS:-/var/lib/tuned/ocp-node-labels.cfg}
 cluster_pod_labels=${CLUSTER_POD_LABELS:-/var/lib/tuned/ocp-pod-labels.cfg}
+openshift_tuned_pid_file=/run/openshift-tuned/openshift-tuned.pid
 
-SYSTEMD_IGNORE_CHROOT=1 systemctl disable tuned --now || :
+start() {
+  SYSTEMD_IGNORE_CHROOT=1 systemctl disable tuned --now || :
 
-# Tuned can take ~20s to reload/start when "ulimit -Sn == 1048576".
-# See:
-# - https://github.com/redhat-performance/tuned/issues/146
-# - https://www.python.org/dev/peps/pep-0446/#closing-all-open-file-descriptors
-# - http://bugs.python.org/issue1663329
-ulimit -Sn 1024	# workaround for the issue above
+  # Tuned can take ~20s to reload/start when "ulimit -Sn == 1048576".
+  # See:
+  # - https://github.com/redhat-performance/tuned/issues/146
+  # - https://www.python.org/dev/peps/pep-0446/#closing-all-open-file-descriptors
+  # - http://bugs.python.org/issue1663329
+  ulimit -Sn 1024	# workaround for the issue above
 
-openshift-tuned \
-           -v=1 \
-           -node-labels $cluster_node_labels \
-           -pod-labels $cluster_pod_labels \
-           -watch-file /etc/tuned/recommend.d/ \
-           -watch-file /var/lib/tuned/profiles-data/ \
-           ${OCP_NODE_NAME}
+  openshift-tuned \
+    -v=1 \
+    -node-labels $cluster_node_labels \
+    -pod-labels $cluster_pod_labels \
+    -watch-file /etc/tuned/recommend.d/ \
+    -watch-file /var/lib/tuned/profiles-data/ \
+    ${OCP_NODE_NAME}
+}
+
+stop() {
+  local openshift_tuned_pid=$(cat $openshift_tuned_pid_file 2>&1 | tr -d '\n')
+
+  kill -TERM $openshift_tuned_pid
+  while kill -0 $openshift_tuned_pid >/dev/null 2>&1
+  do
+    sleep 1
+  done
+  rm -f $openshift_tuned_pid_file
+}
+
+$@

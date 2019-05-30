@@ -1,0 +1,31 @@
+Remove this fix once https://github.com/redhat-performance/tuned/pull/143 is productized.
+
+--- a/daemon/controller.py
++++ b/daemon/controller.py
+@@ -134,7 +134,11 @@ def reload(self, caller = None):
+ 		if not self._daemon.is_running():
+ 			return False
+ 		else:
+-			return self.stop() and self.start()
++			stop_ok = self.stop()
++			if not stop_ok:
++				return False
++			self._daemon.reload_profile_config()
++			return self.start()
+ 
+ 	def _switch_profile(self, profile_name, manual):
+ 		was_running = self._daemon.is_running()
+
+--- a/daemon/daemon.py
++++ b/daemon/daemon.py
+@@ -58,6 +58,10 @@ def _init_threads(self):
+ 		self._not_used.set()
+ 		self._profile_applied = threading.Event()
+ 
++	def reload_profile_config(self):
++		"""Read configuration files again and load profile according to them"""
++		self._init_profile(None)
++
+ 	def _init_profile(self, profile_names):
+ 		manual = True
+ 		if profile_names is None:
