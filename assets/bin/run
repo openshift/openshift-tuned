@@ -2,7 +2,7 @@
 
 cluster_node_labels=${CLUSTER_NODE_LABELS:-/var/lib/tuned/ocp-node-labels.cfg}
 cluster_pod_labels=${CLUSTER_POD_LABELS:-/var/lib/tuned/ocp-pod-labels.cfg}
-openshift_tuned_pid_file=/run/openshift-tuned/openshift-tuned.pid
+openshift_tuned_socket=/var/lib/tuned/openshift-tuned.sock
 
 start() {
   SYSTEMD_IGNORE_CHROOT=1 systemctl disable tuned --now || :
@@ -24,14 +24,14 @@ start() {
 }
 
 stop() {
-  local openshift_tuned_pid=$(cat $openshift_tuned_pid_file 2>&1 | tr -d '\n')
+  local timeout=10	# wait $timeout [s] for a reply via the socket
+  local response=$(echo stop | socat -t$timeout - UNIX-CONNECT:$openshift_tuned_socket 2>/dev/null)
 
-  kill -TERM $openshift_tuned_pid
-  while kill -0 $openshift_tuned_pid >/dev/null 2>&1
-  do
-    sleep 1
-  done
-  rm -f $openshift_tuned_pid_file
+  if "$response" != "ok"; then
+    # provide a failure message in the event log
+    echo "openshift-tuned stop response: $response" 1>&2
+    return 1
+  fi
 }
 
 $@

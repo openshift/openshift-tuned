@@ -8,6 +8,7 @@ import (
 	"io"            // io.WriteString()
 	"io/ioutil"     // ioutil.ReadFile()
 	"math/rand"     // rand.Seed(), ...
+	"net"           // net.Conn
 	"net/http"      // http server
 	"os"            // os.Exit(), os.Signal, os.Stderr, ...
 	"os/exec"       // os.Exec()
@@ -36,6 +37,11 @@ import (
 // Types
 type arrayFlags []string
 
+type sockAccepted struct {
+	conn net.Conn
+	err  error
+}
+
 type tunedState struct {
 	// label2value map
 	nodeLabels map[string]string
@@ -59,17 +65,17 @@ const (
 	labelDumpInterval      = 5
 	programName            = "openshift-tuned"
 	tunedActiveProfileFile = "/etc/tuned/active_profile"
-	tunedDaemonPidFile     = "/run/tuned/tuned.pid"
 	tunedProfilesConfigMap = "/var/lib/tuned/profiles-data/tuned-profiles.yaml"
 	tunedProfilesDir       = "/etc/tuned"
 	openshiftTunedRunDir   = "/run/" + programName
 	openshiftTunedPidFile  = openshiftTunedRunDir + "/" + programName + ".pid"
+	openshiftTunedSocket   = "/var/lib/tuned/openshift-tuned.sock"
 )
 
 // Global variables
 var (
 	done               = make(chan bool, 1)
-	tuned_exit         = make(chan bool, 1)
+	tunedExit          = make(chan bool, 1)
 	terminationSignals = []os.Signal{syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT}
 	fileNodeLabels     = "/var/lib/tuned/ocp-node-labels.cfg"
 	filePodLabels      = "/var/lib/tuned/ocp-pod-labels.cfg"
@@ -125,6 +131,17 @@ func signalHandler() chan os.Signal {
 		done <- true
 	}()
 	return sigs
+}
+
+func newUnixListener(addr string) (net.Listener, error) {
+	if err := os.Remove(addr); err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+	l, err := net.Listen("unix", addr)
+	if err != nil {
+		return nil, err
+	}
+	return l, nil
 }
 
 func logsCoexist() {
@@ -235,7 +252,7 @@ func tunedRun() {
 	glog.Infof("Starting tuned...")
 
 	defer func() {
-		tuned_exit <- true
+		tunedExit <- true
 	}()
 
 	cmdReader, err := cmd.StderrPipe()
@@ -267,7 +284,7 @@ func tunedRun() {
 	return
 }
 
-func tunedStop() error {
+func tunedStop(s *sockAccepted) error {
 	if cmd == nil {
 		// Looks like there has been a termination signal prior to starting tuned
 		return nil
@@ -280,8 +297,17 @@ func tunedStop() error {
 		return fmt.Errorf("Cannot find the tuned process!")
 	}
 	// Wait for tuned process to stop -- this will enable node-level tuning rollback
-	<-tuned_exit
+	<-tunedExit
 	glog.V(1).Infof("Tuned process terminated")
+
+	if s != nil {
+		// This was a socket-initiated shutdown; indicate a successful settings rollback
+		ok := []byte{'o', 'k'}
+		_, err := (*s).conn.Write(ok)
+		if err != nil {
+			return fmt.Errorf("Cannot write a response via %q: %v", openshiftTunedSocket, err)
+		}
+	}
 
 	return nil
 }
@@ -659,6 +685,7 @@ func changeWatcher() (err error) {
 	var (
 		tuned tunedState
 		wPod  watch.Interface
+		lStop bool
 	)
 
 	nodeName := flag.Args()[0]
@@ -714,17 +741,54 @@ func changeWatcher() (err error) {
 		}
 	}
 
+	l, err := newUnixListener(openshiftTunedSocket)
+	if err != nil {
+		return fmt.Errorf("Cannot create %q listener: %v", openshiftTunedSocket, err)
+	}
+	defer func() {
+		lStop = true
+		l.Close()
+	}()
+
+	sockConns := make(chan sockAccepted, 1)
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if lStop {
+				// The listener was closed on the return from mainLoop(); exit the goroutine
+				return
+			}
+			sockConns <- sockAccepted{conn, err}
+		}
+	}()
+
 	for {
 		select {
 		case <-done:
 			// Termination signal received, stop
 			glog.V(2).Infof("changeWatcher done")
-			if err := tunedStop(); err != nil {
+			if err := tunedStop(nil); err != nil {
 				glog.Errorf("%s", err.Error())
 			}
 			return nil
 
-		case <-tuned_exit:
+		case s := <-sockConns:
+			if s.err != nil {
+				return fmt.Errorf("Connection accept error: %v", err)
+			}
+
+			buf := make([]byte, len("stop"))
+			nr, _ := s.conn.Read(buf)
+			data := buf[0:nr]
+
+			if string(data) == "stop" {
+				if err := tunedStop(&s); err != nil {
+					glog.Errorf("%s", err.Error())
+				}
+				return nil
+			}
+
+		case <-tunedExit:
 			cmd = nil // cmd.Start() cannot be used more than once
 			return fmt.Errorf("Tuned process exitted")
 
