@@ -11,10 +11,11 @@ WORKDIR ${APP_ROOT}
 COPY --from=builder /go/src/github.com/openshift/openshift-tuned/openshift-tuned /usr/bin/
 COPY --from=builder /go/src/github.com/openshift/openshift-tuned/assets ${APP_ROOT}
 RUN INSTALL_PKGS=" \
-      tuned hdparm kernel-tools patch \
+      tuned patch \
       " && \
-    yum install --setopt=tsflags=nodocs -y $INSTALL_PKGS && \
-    rpm -V $INSTALL_PKGS && \
+    ARCH_DEP_PKGS=$(if [ "$(uname -m)" != "s390x" ]; then echo -n hdparm kernel-tools ; fi) && \
+    yum install --setopt=tsflags=nodocs -y $INSTALL_PKGS $ARCH_DEP_PKGS && \
+    rpm -V $INSTALL_PKGS $ARCH_DEP_PKGS && \
     (LC_COLLATE=C cat patches/*.diff | patch -p1 -d /usr/lib/python*/site-packages/tuned/ || :) && \
     touch /etc/sysctl.conf && \
     yum -y remove patch && \
