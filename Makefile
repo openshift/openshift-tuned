@@ -1,25 +1,21 @@
-PROGRAM=openshift-tuned
-SRC_DIR=cmd
-BIN_DIR=./
+PACKAGE=github.com/openshift/openshift-tuned
+PACKAGE_BIN=$(lastword $(subst /, ,$(PACKAGE)))
+PACKAGE_SRC=$(wildcard cmd/*.go)
+
 DOCKERFILE=Dockerfile
 IMAGE_TAG=openshift/openshift-tuned
 IMAGE_REGISTRY=quay.io
+GO=GO111MODULE=on GOFLAGS=-mod=vendor go
 GOFMT_CHECK=$(shell find . -not \( \( -wholename './.*' -o -wholename '*/vendor/*' \) -prune \) -name '*.go' | sort -u | xargs gofmt -s -l)
 REV=$(shell git describe --long --tags --match='v*' --always --dirty)
 
-all: $(BIN_DIR)/$(PROGRAM)
+all: $(PACKAGE_BIN)
 
-$(BIN_DIR)/$(PROGRAM) build: $(SRC_DIR)/$(PROGRAM).go
-	go build -o $(BIN_DIR)/$(PROGRAM) -ldflags '-X main.version=$(REV)' $<
+$(PACKAGE_BIN) build: $(PACKAGE_SRC)
+	$(GO) build -o $(PACKAGE_BIN) -ldflags '-X main.version=$(REV)' $^
 
-run: $(SRC_DIR)/$(PROGRAM).go
-	go run $<
-
-vet: $(SRC_DIR)/$(PROGRAM).go
-	go tool vet -shadow=false -printfuncs=Info,Infof,Warning,Warningf $<
-
-strip:
-	strip $(BIN_DIR)/$(PROGRAM)
+vet: $(PACKAGE_SRC)
+	$(GO) vet -printfuncs=Info,Infof,Warning,Warningf $^
 
 verify:	verify-gofmt
 
@@ -36,11 +32,11 @@ else
 endif
 
 test:
-	go test ./cmd/... -coverprofile cover.out
+	$(GO) test ./cmd/... -coverprofile cover.out
 
 clean:
-	go clean
-	rm -f $(BIN)
+	$(GO) clean
+	rm -f $(PACKAGE_BIN)
 
 local-image:
 ifdef USE_BUILDAH
@@ -57,4 +53,4 @@ else
 	sudo docker push $(IMAGE_REGISTRY)/$(IMAGE_TAG)
 endif
 
-.PHONY: all build run fmt format vet strip clean local-image local-image-push
+.PHONY: all build run fmt format vet clean local-image local-image-push
