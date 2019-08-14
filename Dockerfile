@@ -15,7 +15,7 @@ RUN INSTALL_PKGS=" \
       " && \
     yum install --setopt=tsflags=nodocs -y $INSTALL_PKGS && \
     rpm -V $INSTALL_PKGS && \
-    (patch -p1 -d /usr/lib/python*/site-packages/tuned/daemon/ < patches/tuned.diff || :) && \ 
+    (LC_COLLATE=C cat patches/*.diff | patch -Np1 -d /usr/lib/python*/site-packages/tuned/ || :) && \
     sed -i 's/^\s*daemon.*$/daemon = 0/' /etc/tuned/tuned-main.conf && \
     touch /etc/sysctl.conf && \
     yum -y remove patch && \
