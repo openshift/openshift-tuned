@@ -29,3 +29,13 @@ Remove this fix once https://github.com/redhat-performance/tuned/pull/143 is pro
  	def _init_profile(self, profile_names):
  		manual = True
  		if profile_names is None:
+@@ -117,6 +117,9 @@
+ 		return errstr
+ 
+ 	def _full_rollback_required(self):
++                # if we are in chroot, we cannot use systemctl
++                if [ "$(stat -c %d:%i /)" != "$(stat -c %d:%i /proc/1/root/.)" ]:
++                    return False
+ 		retcode, out = self._cmd.execute(["systemctl", "is-system-running"], no_errors = [0])
+ 		if retcode < 0:
+ 			return False
