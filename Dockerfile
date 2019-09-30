@@ -3,7 +3,7 @@ WORKDIR /go/src/github.com/openshift/openshift-tuned
 COPY . .
 RUN make build
 
-FROM registry.svc.ci.openshift.org/openshift/origin-v4.0:base
+FROM centos:7
 ENV APP_ROOT=/var/lib/tuned
 ENV PATH=${APP_ROOT}/bin:${PATH}
 ENV HOME=${APP_ROOT}
