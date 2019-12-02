@@ -5,33 +5,30 @@ import (
 	"bytes"         // bytes.Buffer
 	"flag"          // command-line options parsing
 	"fmt"           // Printf()
-	"io"            // io.WriteString()
 	"io/ioutil"     // ioutil.ReadFile()
-	"math/rand"     // rand.Seed(), ...
+	"math"          // math.Pow()
 	"net"           // net.Conn
-	"net/http"      // http server
 	"os"            // os.Exit(), os.Signal, os.Stderr, ...
 	"os/exec"       // os.Exec()
 	"os/signal"     // signal.Notify()
 	"os/user"       // user.Current()
 	"path/filepath" // filepath.Join()
-	"reflect"       // reflect.DeepEqual()
 	"strconv"       // strconv
 	"strings"       // strings.Join()
 	"syscall"       // syscall.SIGHUP, ...
-	"time"          // time.Sleep()
+	"time"          // time.Second, ...
 
-	"github.com/fsnotify/fsnotify"
-	"github.com/golang/glog"
-	"gopkg.in/yaml.v2"
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/watch"
-	"k8s.io/client-go/kubernetes"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/klog"
+
+	"github.com/fsnotify/fsnotify"
+	"gopkg.in/yaml.v2"
+
+	tunedv1 "github.com/openshift/cluster-node-tuning-operator/pkg/apis/tuned/v1"
+	tunedclientset "github.com/openshift/cluster-node-tuning-operator/pkg/generated/clientset/versioned"
 )
 
 // Types
@@ -42,22 +39,10 @@ type sockAccepted struct {
 	err  error
 }
 
-type resync struct {
-	now int64
-	min int64
-}
-
 type tunedState struct {
-	// label2value map
-	nodeLabels map[string]string
-	// namespace/podname -> label2value map
-	podLabels         map[string]map[string]string
-	podLabelsPullTime int64
-	change            struct {
-		// did node labels change?
-		node bool
-		// did pod labels change?
-		pod bool
+	change struct {
+		// did profile change?
+		profile bool
 		// did tuned profiles/recommend config change on the filesystem?
 		cfg bool
 	}
@@ -65,15 +50,14 @@ type tunedState struct {
 
 // Constants
 const (
-	resyncPeriodNodeDefault = 60
-	resyncPeriodNodeMax     = 3600     // maximum resync node period due to exponential backoff
-	resyncPeriodPodDefault  = 3600 * 8 // rely on watches and only pull pod labels every resyncPeriodPodDefault [s]
-	// Minimum interval between writing changed node/pod labels for tuned daemon in [s]
-	labelDumpInterval      = 5
+	operandNamespace       = "openshift-cluster-node-tuning-operator"
+	profileExtractInterval = 1
 	programName            = "openshift-tuned"
 	tunedActiveProfileFile = "/etc/tuned/active_profile"
 	tunedProfilesConfigMap = "/var/lib/tuned/profiles-data/tuned-profiles.yaml"
 	tunedProfilesDir       = "/etc/tuned"
+	tunedRecommendDir      = tunedProfilesDir + "/recommend.d"
+	tunedRecommendFile     = tunedRecommendDir + "/" + "50-openshift.conf"
 	openshiftTunedRunDir   = "/run/" + programName
 	openshiftTunedPidFile  = openshiftTunedRunDir + "/" + programName + ".pid"
 	openshiftTunedSocket   = "/var/lib/tuned/openshift-tuned.sock"
@@ -84,8 +68,6 @@ var (
 	done               = make(chan bool, 1)
 	tunedExit          = make(chan bool, 1)
 	terminationSignals = []os.Signal{syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT}
-	fileNodeLabels     = "/var/lib/tuned/ocp-node-labels.cfg"
-	filePodLabels      = "/var/lib/tuned/ocp-pod-labels.cfg"
 	fileWatch          arrayFlags
 	version            string // programName version
 	cmd                *exec.Cmd
@@ -115,6 +97,7 @@ func (a *arrayFlags) Set(value string) error {
 }
 
 func parseCmdOpts() {
+	klog.InitFlags(nil)
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options] <NODE>\n", programName)
 		fmt.Fprintf(os.Stderr, "Example: %s b1.lan\n\n", programName)
@@ -124,8 +107,6 @@ func parseCmdOpts() {
 	}
 
 	flag.Var(&fileWatch, "watch-file", "Files/directories to watch for changes.")
-	flag.StringVar(&fileNodeLabels, "node-labels", fileNodeLabels, "File to dump node-labels to for tuned.")
-	flag.StringVar(&filePodLabels, "pod-labels", filePodLabels, "File to dump pod-labels to for tuned.")
 	flag.Parse()
 }
 
@@ -134,7 +115,7 @@ func signalHandler() chan os.Signal {
 	signal.Notify(sigs, terminationSignals...)
 	go func() {
 		sig := <-sigs
-		glog.V(1).Infof("Received signal: %v", sig)
+		klog.V(1).Infof("received signal: %v", sig)
 		done <- true
 	}()
 	return sigs
@@ -151,23 +132,6 @@ func newUnixListener(addr string) (net.Listener, error) {
 	return l, nil
 }
 
-func logsCoexist() {
-	flag.Set("logtostderr", "true")
-	flag.Parse()
-
-	klogFlags := flag.NewFlagSet("klog", flag.ExitOnError)
-	klog.InitFlags(klogFlags)
-
-	// Sync the glog and klog flags.
-	flag.CommandLine.VisitAll(func(f1 *flag.Flag) {
-		f2 := klogFlags.Lookup(f1.Name)
-		if f2 != nil {
-			value := f1.Value.String()
-			f2.Value.Set(value)
-		}
-	})
-}
-
 // getConfig creates a *rest.Config for talking to a Kubernetes apiserver.
 //
 // Config precedence
@@ -178,7 +142,7 @@ func logsCoexist() {
 func getConfig() (*rest.Config, error) {
 	configFromFlags := func(kubeConfig string) (*rest.Config, error) {
 		if _, err := os.Stat(kubeConfig); err != nil {
-			return nil, fmt.Errorf("Cannot stat kubeconfig '%s'", kubeConfig)
+			return nil, fmt.Errorf("cannot stat kubeconfig %q", kubeConfig)
 		}
 		return clientcmd.BuildConfigFromFlags("", kubeConfig)
 	}
@@ -198,26 +162,37 @@ func getConfig() (*rest.Config, error) {
 		return configFromFlags(kubeConfig)
 	}
 
-	return nil, fmt.Errorf("Could not locate a kubeconfig")
+	return nil, fmt.Errorf("could not locate a kubeconfig")
 }
 
-func getJitter(period int64, factor float64) int64 {
-	return rand.Int63n(int64(float64(period)*factor+1)) - int64(float64(period)*factor/2)
+func disableSystemTuned() {
+	var (
+		stdout bytes.Buffer
+		stderr bytes.Buffer
+	)
+	klog.V(1).Infof("disabling system tuned...")
+	cmd := exec.Command("/usr/bin/systemctl", "disable", "tuned", "--now")
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err != nil {
+		klog.V(1).Infof("failed to disable system tuned: %s", stderr.String()) // do not use log.Printf(), tuned has its own timestamping
+	}
 }
 
 func profilesExtract() error {
-	glog.Infof("Extracting tuned profiles")
+	klog.Infof("extracting tuned profiles")
 
 	tunedProfilesYaml, err := ioutil.ReadFile(tunedProfilesConfigMap)
 	if err != nil {
-		return fmt.Errorf("Failed to open tuned profiles ConfigMap file '%s': %v", tunedProfilesConfigMap, err)
+		return fmt.Errorf("failed to open tuned profiles ConfigMap file %q: %v", tunedProfilesConfigMap, err)
 	}
 
 	mProfiles := make(map[string]string)
 
 	err = yaml.Unmarshal(tunedProfilesYaml, &mProfiles)
 	if err != nil {
-		return fmt.Errorf("Failed to parse tuned profiles ConfigMap file '%s': %v", tunedProfilesConfigMap, err)
+		return fmt.Errorf("failed to parse tuned profiles ConfigMap file %q: %v", tunedProfilesConfigMap, err)
 	}
 
 	for key, value := range mProfiles {
@@ -225,16 +200,16 @@ func profilesExtract() error {
 		profileFile := fmt.Sprintf("%s/%s", profileDir, "tuned.conf")
 
 		if err = mkdir(profileDir); err != nil {
-			return fmt.Errorf("Failed to create tuned profile directory '%s': %v", profileDir, err)
+			return fmt.Errorf("failed to create tuned profile directory %q: %v", profileDir, err)
 		}
 
 		f, err := os.Create(profileFile)
 		if err != nil {
-			return fmt.Errorf("Failed to create tuned profile file '%s': %v", profileFile, err)
+			return fmt.Errorf("failed to create tuned profile file %q: %v", profileFile, err)
 		}
 		defer f.Close()
 		if _, err = f.WriteString(value); err != nil {
-			return fmt.Errorf("Failed to write tuned profile file '%s': %v", profileFile, err)
+			return fmt.Errorf("failed to write tuned profile file %q: %v", profileFile, err)
 		}
 	}
 	return nil
@@ -242,15 +217,31 @@ func profilesExtract() error {
 
 func openshiftTunedPidFileWrite() error {
 	if err := mkdir(openshiftTunedRunDir); err != nil {
-		return fmt.Errorf("Failed to create %s run directory '%s': %v", programName, openshiftTunedRunDir, err)
+		return fmt.Errorf("failed to create %s run directory %q: %v", programName, openshiftTunedRunDir, err)
 	}
 	f, err := os.Create(openshiftTunedPidFile)
 	if err != nil {
-		return fmt.Errorf("Failed to create openshift-tuned pid file '%s': %v", openshiftTunedPidFile, err)
+		return fmt.Errorf("failed to create %s pid file %q: %v", programName, openshiftTunedPidFile, err)
 	}
 	defer f.Close()
 	if _, err = f.WriteString(strconv.Itoa(os.Getpid())); err != nil {
-		return fmt.Errorf("Failed to write openshift-tuned pid file '%s': %v", openshiftTunedPidFile, err)
+		return fmt.Errorf("failed to write %s pid file %q: %v", programName, openshiftTunedPidFile, err)
+	}
+	return nil
+}
+
+func tunedRecommendFileWrite(profileName string) error {
+	klog.V(2).Infof("tunedRecommendFileWrite(): %s", profileName)
+	if err := mkdir(tunedRecommendDir); err != nil {
+		return fmt.Errorf("failed to create directory %q: %v", tunedRecommendDir, err)
+	}
+	f, err := os.Create(tunedRecommendFile)
+	if err != nil {
+		return fmt.Errorf("failed to create file %q: %v", tunedRecommendFile, err)
+	}
+	defer f.Close()
+	if _, err = f.WriteString(fmt.Sprintf("[%s]\n%s=.*\n", profileName, tunedRecommendFile)); err != nil {
+		return fmt.Errorf("failed to write file %q: %v", tunedRecommendFile, err)
 	}
 	return nil
 }
@@ -260,7 +251,7 @@ func tunedCreateCmd() *exec.Cmd {
 }
 
 func tunedRun() {
-	glog.Infof("Starting tuned...")
+	klog.Infof("starting tuned...")
 
 	defer func() {
 		tunedExit <- true
@@ -268,7 +259,7 @@ func tunedRun() {
 
 	cmdReader, err := cmd.StderrPipe()
 	if err != nil {
-		glog.Errorf("Error creating StderrPipe for tuned: %v", err)
+		klog.Errorf("error creating StderrPipe for tuned: %v", err)
 		return
 	}
 
@@ -281,14 +272,14 @@ func tunedRun() {
 
 	err = cmd.Start()
 	if err != nil {
-		glog.Errorf("Error starting tuned: %v", err)
+		klog.Errorf("error starting tuned: %v", err)
 		return
 	}
 
 	err = cmd.Wait()
 	if err != nil {
 		// The command exited with non 0 exit status, e.g. terminated by a signal
-		glog.Errorf("Error waiting for tuned: %v", err)
+		klog.Errorf("error waiting for tuned: %v", err)
 		return
 	}
 
@@ -301,22 +292,22 @@ func tunedStop(s *sockAccepted) error {
 		return nil
 	}
 	if cmd.Process != nil {
-		glog.V(1).Infof("Sending TERM to PID %d", cmd.Process.Pid)
+		klog.V(1).Infof("sending TERM to PID %d", cmd.Process.Pid)
 		cmd.Process.Signal(syscall.SIGTERM)
 	} else {
 		// This should never happen
-		return fmt.Errorf("Cannot find the tuned process!")
+		return fmt.Errorf("cannot find the tuned process!")
 	}
 	// Wait for tuned process to stop -- this will enable node-level tuning rollback
 	<-tunedExit
-	glog.V(1).Infof("Tuned process terminated")
+	klog.V(1).Infof("tuned process terminated")
 
 	if s != nil {
 		// This was a socket-initiated shutdown; indicate a successful settings rollback
 		ok := []byte{'o', 'k'}
 		_, err := (*s).conn.Write(ok)
 		if err != nil {
-			return fmt.Errorf("Cannot write a response via %q: %v", openshiftTunedSocket, err)
+			return fmt.Errorf("cannot write a response via %q: %v", openshiftTunedSocket, err)
 		}
 	}
 
@@ -331,90 +322,19 @@ func tunedReload() error {
 		return nil
 	}
 
-	glog.Infof("Reloading tuned...")
+	klog.Infof("reloading tuned...")
 
 	if cmd.Process != nil {
-		glog.Infof("Sending HUP to PID %d", cmd.Process.Pid)
+		klog.Infof("sending HUP to PID %d", cmd.Process.Pid)
 		err := cmd.Process.Signal(syscall.SIGHUP)
 		if err != nil {
-			return fmt.Errorf("Error sending SIGHUP to PID %d: %v\n", cmd.Process.Pid, err)
+			return fmt.Errorf("error sending SIGHUP to PID %d: %v\n", cmd.Process.Pid, err)
 		}
 	} else {
 		// This should never happen
-		return fmt.Errorf("Cannot find the tuned process!")
+		return fmt.Errorf("cannot find the tuned process!")
 	}
 
-	return nil
-}
-
-func nodeLabelsGet(clientset *kubernetes.Clientset, nodeName string) (map[string]string, error) {
-	node, err := clientset.CoreV1().Nodes().Get(nodeName, metav1.GetOptions{})
-	if errors.IsNotFound(err) {
-		return nil, fmt.Errorf("Node %s not found", nodeName)
-	} else if statusError, isStatus := err.(*errors.StatusError); isStatus {
-		return nil, fmt.Errorf("Error getting node %s: %v", nodeName, statusError.ErrStatus.Message)
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	return node.Labels, nil
-}
-
-func podLabelsGet(clientset *kubernetes.Clientset, nodeName string) (map[string]map[string]string, error) {
-	var sb strings.Builder
-	pods, err := clientset.CoreV1().Pods("").List(metav1.ListOptions{FieldSelector: "spec.nodeName=" + nodeName})
-	if err != nil {
-		return nil, err
-	}
-
-	podLabels := map[string]map[string]string{}
-	for _, pod := range pods.Items {
-		sb.WriteString(pod.Namespace)
-		sb.WriteString("/")
-		sb.WriteString(pod.Name)
-		podLabels[sb.String()] = pod.Labels // key is "podNamespace/podName"
-		sb.Reset()
-	}
-
-	return podLabels, nil
-}
-
-func nodeLabelsDump(labels map[string]string, fileLabels string) error {
-	f, err := os.Create(fileLabels)
-	if err != nil {
-		return fmt.Errorf("Failed to create labels file '%s': %v", fileLabels, err)
-	}
-	defer f.Close()
-
-	glog.V(1).Infof("Dumping labels to %s", fileLabels)
-	for key, value := range labels {
-		_, err := f.WriteString(fmt.Sprintf("%s=%s\n", key, value))
-		if err != nil {
-			return fmt.Errorf("Error writing to labels file %s: %v", fileLabels, err)
-		}
-	}
-	f.Sync()
-	return nil
-}
-
-func podLabelsDump(labels map[string]map[string]string, fileLabels string) error {
-	f, err := os.Create(fileLabels)
-	if err != nil {
-		return fmt.Errorf("Failed to create labels file '%s': %v", fileLabels, err)
-	}
-	defer f.Close()
-
-	glog.V(1).Infof("Dumping labels to %s", fileLabels)
-	for _, values := range labels {
-		for key, value := range values {
-			_, err := f.WriteString(fmt.Sprintf("%s=%s\n", key, value))
-			if err != nil {
-				return fmt.Errorf("Error writing to labels file %s: %v", fileLabels, err)
-			}
-		}
-	}
-	f.Sync()
 	return nil
 }
 
@@ -423,7 +343,7 @@ func getActiveProfile() (string, error) {
 
 	f, err := os.Open(tunedActiveProfileFile)
 	if err != nil {
-		return "", fmt.Errorf("Error opening tuned active profile file %s: %v", tunedActiveProfileFile, err)
+		return "", fmt.Errorf("error opening tuned active profile file %s: %v", tunedActiveProfileFile, err)
 	}
 	defer f.Close()
 
@@ -438,193 +358,27 @@ func getActiveProfile() (string, error) {
 func getRecommendedProfile() (string, error) {
 	var stdout, stderr bytes.Buffer
 
-	glog.V(1).Infof("Getting recommended profile...")
+	klog.V(1).Infof("getting recommended profile...")
 	cmd := exec.Command("/usr/sbin/tuned-adm", "recommend")
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	if err != nil {
-		return "", fmt.Errorf("Error getting recommended profile: %v: %v", err, stderr.String())
+		return "", fmt.Errorf("error getting recommended profile: %v: %v", err, stderr.String())
 	}
 
 	responseString := strings.TrimSpace(stdout.String())
 	return responseString, nil
 }
 
-func apiActiveProfile(w http.ResponseWriter, req *http.Request) {
-	responseString, err := getActiveProfile()
-
-	if err != nil {
-		glog.Error(err)
-	}
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Header().Set("Content-Length", strconv.Itoa(len(responseString)))
-	io.WriteString(w, responseString)
-}
-
-func nodeWatch(clientset *kubernetes.Clientset, nodeName string) (watch.Interface, error) {
-	w, err := clientset.CoreV1().Nodes().Watch(metav1.ListOptions{FieldSelector: "metadata.name=" + nodeName})
-	if err != nil {
-		return nil, fmt.Errorf("Unexpected error watching node %s: %v", nodeName, err)
-	}
-	return w, nil
-}
-
-func podWatch(clientset *kubernetes.Clientset, nodeName string) (watch.Interface, error) {
-	w, err := clientset.CoreV1().Pods("").Watch(metav1.ListOptions{FieldSelector: "spec.nodeName=" + nodeName})
-	if err != nil {
-		return nil, fmt.Errorf("Unexpected error watching pods on %s: %v", nodeName, err)
-	}
-	return w, nil
-}
-
-func nodeChangeHandler(event watch.Event, tuned *tunedState) {
-	node, ok := event.Object.(*corev1.Node)
-	if !ok {
-		glog.Warningf("Unexpected object received: %#v", event.Object)
-		return
-	}
-
-	if !reflect.DeepEqual(node.Labels, tuned.nodeLabels) {
-		// Node labels changed
-		tuned.nodeLabels = node.Labels
-		tuned.change.node = true
-		return
-	}
-
-	// Node labels didn't change, event didn't modify labels
-}
-
-// podLabelsUnique goes through pod labels of all the pods on a node
-// (podLabelsNodeWide) and returns a subset of podLabels unique to podNsName;
-// i.e. the retuned labels (key & value) will not exist on any other pod that
-// live on the same node as podNsName.
-func podLabelsUnique(podLabelsNodeWide map[string]map[string]string,
-	podNsName string,
-	podLabels map[string]string) map[string]string {
-	unique := map[string]string{}
-
-	if podLabelsNodeWide == nil {
-		return podLabels
-	}
-
-LoopNeedle:
-	for kNeedle, vNeedle := range podLabels {
-		for kHaystack, vHaystack := range podLabelsNodeWide {
-			if kHaystack == podNsName {
-				// Skip the podNsName labels which are part of podLabelsNodeWide
-				continue
-			}
-			if v, ok := vHaystack[kNeedle]; ok && v == vNeedle {
-				// We've found a matching key/value pair label in vHaystack, kNeedle/vNeedle is not unique
-				continue LoopNeedle
-			}
-		}
-
-		// We've found label kNeedle with value vNeedle unique to pod podNsName
-		unique[kNeedle] = vNeedle
-	}
-
-	return unique
-}
-
-// podLabelsNodeWideChange returns true, if the change in current pod labels
-// (podLabels) affects pod labels node-wide.  In other words, new or removed
-// labels (key & value) on podNsName does *not* exist on any other pod that
-// lives on the same node as podNsName.
-func podLabelsNodeWideChange(podLabelsNodeWide map[string]map[string]string,
-	podNsName string,
-	podLabels map[string]string) bool {
-	if podLabelsNodeWide == nil {
-		return podLabels != nil && len(podLabels) > 0
-	}
-
-	// Fetch old labels for pod podNsName, not found on any other pod that lives on the same node
-	oldPodLabelsUnique := podLabelsUnique(podLabelsNodeWide, podNsName, podLabelsNodeWide[podNsName])
-	// Fetch current labels for pod podNsName, not found on any other pod that lives on the same node
-	curPodLabelsUnique := podLabelsUnique(podLabelsNodeWide, podNsName, podLabels)
-	// If there is a difference between old and current unique pod labels, a unique pod label was
-	// added/removed or both
-	change := !reflect.DeepEqual(oldPodLabelsUnique, curPodLabelsUnique)
-
-	glog.V(1).Infof("Pod (%s) labels changed node wide: %v", podNsName, change)
-	return change
-}
-
-// podChangeHandler handles pod events.  It ensures information about pod label
-// changes that affect tuned reload is recorded so that it can be acted upon at
-// a later stage.  Labels of pods that co-exist with the pod that caused this
-// handler to be called are also taken into account not to cause unnecessary
-// tuned reloads.
-func podChangeHandler(event watch.Event, tuned *tunedState) {
-	var sb strings.Builder
-	pod, ok := event.Object.(*corev1.Pod)
-	if !ok {
-		glog.Warningf("Unexpected object received: %#v", event.Object)
-		return
-	}
-
-	sb.WriteString(pod.Namespace)
-	sb.WriteString("/")
-	sb.WriteString(pod.Name)
-	key := sb.String()
-
-	if event.Type == watch.Deleted && tuned.podLabels != nil {
-		glog.V(2).Infof("Delete event: %s", key)
-		tuned.change.pod = tuned.change.pod || podLabelsNodeWideChange(tuned.podLabels, key, nil)
-		delete(tuned.podLabels, key)
-		return
-	}
-
-	if !reflect.DeepEqual(pod.Labels, tuned.podLabels[key]) {
-		// Pod labels changed
-		if tuned.podLabels == nil {
-			tuned.podLabels = map[string]map[string]string{}
-		}
-		tuned.change.pod = tuned.change.pod || podLabelsNodeWideChange(tuned.podLabels, key, pod.Labels)
-		tuned.podLabels[key] = pod.Labels
-		return
-	}
-
-	// Pod labels didn't change, event didn't modify labels
-	glog.V(2).Infof("Pod labels didn't change, event didn't modify labels")
-}
-
-func eventWatch(w watch.Interface, f func(watch.Event, *tunedState), tuned *tunedState) {
-	defer w.Stop()
-	for event := range w.ResultChan() {
-		f(event, tuned)
-	}
-}
-
 func timedTunedReloader(tuned *tunedState) (err error) {
-	var (
-		reload        bool
-		labelsChanged bool
-	)
+	var reload bool
 
-	// Check pod labels
-	if tuned.change.pod {
-		// Pod labels changed
-		tuned.change.pod = false
-		if err = podLabelsDump(tuned.podLabels, filePodLabels); err != nil {
-			return err
-		}
-		labelsChanged = true
-	}
-	// Check node labels
-	if tuned.change.node {
-		// Node labels changed
-		tuned.change.node = false
-		if err = nodeLabelsDump(tuned.nodeLabels, fileNodeLabels); err != nil {
-			return err
-		}
-		labelsChanged = true
-	}
-	// Check whether reload of tuned is really necessary due to pod/node label changes
-	if labelsChanged {
-		// Pod/Node labels changed
+	// Check whether reload of tuned is really necessary due to a profile change
+	if tuned.change.profile {
+		// Profile changed
 		var activeProfile, recommendedProfile string
+		tuned.change.profile = false
 		if activeProfile, err = getActiveProfile(); err != nil {
 			return err
 		}
@@ -632,13 +386,19 @@ func timedTunedReloader(tuned *tunedState) (err error) {
 			return err
 		}
 		if activeProfile != recommendedProfile {
-			glog.V(1).Infof("Active profile (%s) != recommended profile (%s)", activeProfile, recommendedProfile)
+			klog.V(1).Infof("active profile (%s) != recommended profile (%s)", activeProfile, recommendedProfile)
+			recommendedProfileDir := tunedProfilesDir + "/" + recommendedProfile
+			if _, err := os.Stat(recommendedProfileDir); os.IsNotExist(err) {
+				// Workaround for tuned BZ1774645; do not send SIGHUP to tuned if the profile directory doesn't exist
+				klog.V(1).Infof("tuned profile directory %q does not exist", recommendedProfileDir)
+				return nil // retry later on a filesystem event
+			}
 			reload = true
 		} else {
-			glog.V(1).Infof("Active and recommended profile (%s) match.  Label changes will not trigger profile reload.", activeProfile)
+			klog.V(1).Infof("active and recommended profile (%s) match; profile change will not trigger profile reload", activeProfile)
 		}
 	}
-	// Check tuned profiles/recommend file changes
+	// Check tuned profiles file changes
 	if tuned.change.cfg {
 		tuned.change.cfg = false
 		if err = profilesExtract(); err != nil {
@@ -652,114 +412,87 @@ func timedTunedReloader(tuned *tunedState) (err error) {
 	return err
 }
 
-func pullLabels(clientset *kubernetes.Clientset, tuned *tunedState, nodeName string) error {
-	// Resync period elapsed, force-pull node and pod labels
-	glog.V(2).Infof("Pulling node labels")
-	nodeLabels, err := nodeLabelsGet(clientset, nodeName)
-	if err != nil {
-		return err
+func getTunedProfile(obj interface{}) (profile *tunedv1.Profile, err error) {
+	profile, ok := obj.(*tunedv1.Profile)
+	if !ok {
+		return nil, fmt.Errorf("could not convert object to a tuned profile object: %+v", obj)
 	}
-	if !reflect.DeepEqual(nodeLabels, tuned.nodeLabels) {
-		tuned.nodeLabels = nodeLabels
-		tuned.change.node = true
-	}
-
-	nowUnix := time.Now().Unix()
-	if nowUnix >= tuned.podLabelsPullTime {
-		glog.V(2).Infof("Pulling pod labels")
-		// Pull for pod labels was done >= resyncPeriodPodDefault
-		podLabels, err := podLabelsGet(clientset, nodeName)
-		if err != nil {
-			return err
-		}
-		tuned.setNextPodLabelsPullTime(nowUnix)
-		if !reflect.DeepEqual(podLabels, tuned.podLabels) {
-			tuned.podLabels = podLabels
-			tuned.change.pod = true
-		}
-	}
-
-	return nil
+	return profile, nil
 }
 
-func pullResyncPeriod() int64 {
+func changeWatcher() (err error) {
 	var (
-		err                  error
-		resyncPeriodDuration int64 = resyncPeriodNodeDefault
+		tuned         tunedState
+		lStop         bool
+		nodeName      string          = flag.Args()[0]
+		fieldSelector fields.Selector = fields.SelectorFromSet(fields.Set{"metadata.name": nodeName})
 	)
-	if os.Getenv("RESYNC_PERIOD") != "" {
-		resyncPeriodDuration, err = strconv.ParseInt(os.Getenv("RESYNC_PERIOD"), 10, 64)
-		if err != nil {
-			glog.Errorf("Error: cannot parse RESYNC_PERIOD (%s), using %d", os.Getenv("RESYNC_PERIOD"), resyncPeriodNodeDefault)
-			resyncPeriodDuration = resyncPeriodNodeDefault
-		}
-	}
-
-	return resyncPeriodDuration
-}
-
-func pullResyncPeriodWithJitter() int64 {
-	resyncPeriodDuration := pullResyncPeriod()
-
-	// Add some randomness to the resync period, so that we don't end up in lockstep querying the API server
-	return resyncPeriodDuration + getJitter(resyncPeriodDuration, 0.3)
-}
-
-func (tuned *tunedState) setNextPodLabelsPullTime(secsSinceEpoch int64) {
-	tuned.podLabelsPullTime = secsSinceEpoch + resyncPeriodPodDefault + getJitter(resyncPeriodPodDefault, 0.3) // try to avoid lockstep
-}
-
-func (resyncPeriod *resync) changeWatcher() (err error) {
-	var (
-		tuned tunedState
-		wPod  watch.Interface
-		lStop bool
-	)
-
-	nodeName := flag.Args()[0]
 
 	err = profilesExtract()
 	if err != nil {
 		return err
 	}
 
-	config, err := getConfig()
+	kubeConfig, err := getConfig()
 	if err != nil {
 		return err
 	}
 
-	clientset, err := kubernetes.NewForConfig(config)
+	cs, err := tunedclientset.NewForConfig(kubeConfig)
 	if err != nil {
 		return err
 	}
 
-	// Create a ticker to do a full node/pod labels pull
-	tickerPull := time.NewTicker(time.Second * time.Duration(resyncPeriod.now))
-	defer tickerPull.Stop()
-	glog.Infof("Resync period to pull node/pod labels: %d [s]", resyncPeriod.now)
+	// Perform an initial list and start a watch on Profiles in operand namespace
+	profileLW := cache.NewListWatchFromClient(cs.TunedV1().RESTClient(), "Profiles", operandNamespace, fieldSelector)
 
-	// When the first pod pull should happen; try to avoid lockstep
-	tuned.setNextPodLabelsPullTime(time.Now().Unix())
+	si := cache.NewSharedInformer(profileLW, &tunedv1.Profile{}, 0)
+	si.AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			profile, err := getTunedProfile(obj)
+			if err != nil {
+				klog.Errorf("%s", err.Error())
+				return
+			}
+			klog.V(1).Infof("profile %q added, tuned profile requested: %s", profile.ObjectMeta.Name, profile.Spec.Config.TunedProfile)
+			disableSystemTuned() // When moving this call elsewhere, remember it is undesirable to disable system tuned
+			// on nodes that should not be handled by openshift-tuned
+			tunedRecommendFileWrite(profile.Spec.Config.TunedProfile)
+			tuned.change.profile = true
+		},
+		DeleteFunc: func(obj interface{}) {
+			profile, err := getTunedProfile(obj)
+			if err != nil {
+				klog.Errorf("%s", err.Error())
+				return
+			}
+			klog.V(1).Infof("profile %q deleted, keeping the old tuned profile: %s", profile.ObjectMeta.Name, profile.Spec.Config.TunedProfile)
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			profile, err := getTunedProfile(newObj)
+			if err != nil {
+				klog.Errorf("%s", err.Error())
+				return
+			}
+			klog.V(1).Infof("profile %q changed, tuned profile requested: %s", profile.ObjectMeta.Name, profile.Spec.Config.TunedProfile)
+			tunedRecommendFileWrite(profile.Spec.Config.TunedProfile)
+			tuned.change.profile = true
+		},
+	})
 
-	// Pull node and pod labels before entering the loop; node labels would otherwise be fetched after resyncPeriod.now
-	if err := pullLabels(clientset, &tuned, nodeName); err != nil {
-		return err
-	}
+	stop := make(chan struct{})
+	defer close(stop)
+	go si.Run(stop)
 
-	// Create a ticker to dump node/pod labels, extract new profiles and possibly reload tuned;
-	// this also rate-limits reloads to a maximum of labelDumpInterval reloads/s
-	tickerReload := time.NewTicker(time.Second * time.Duration(labelDumpInterval))
+	// Create a ticker to extract new profiles and possibly reload tuned;
+	// this also rate-limits reloads to a maximum of profileExtractInterval reloads/s
+	tickerReload := time.NewTicker(time.Second * time.Duration(profileExtractInterval))
 	defer tickerReload.Stop()
-
-	if wPod, err = podWatch(clientset, nodeName); err != nil {
-		return err
-	}
-	defer wPod.Stop()
 
 	// Watch for filesystem changes on tuned profiles and recommend.conf file(s)
 	wFs, err := fsnotify.NewWatcher()
 	if err != nil {
-		return fmt.Errorf("Failed to create filesystem watcher: %v", err)
+		return fmt.Errorf("failed to create filesystem watcher: %v", err)
 	}
 	defer wFs.Close()
 
@@ -767,13 +500,13 @@ func (resyncPeriod *resync) changeWatcher() (err error) {
 	for _, element := range fileWatch {
 		err = wFs.Add(element)
 		if err != nil {
-			return fmt.Errorf("Failed to start watching '%s': %v", element, err)
+			return fmt.Errorf("failed to start watching %q: %v", element, err)
 		}
 	}
 
 	l, err := newUnixListener(openshiftTunedSocket)
 	if err != nil {
-		return fmt.Errorf("Cannot create %q listener: %v", openshiftTunedSocket, err)
+		return fmt.Errorf("cannot create %q listener: %v", openshiftTunedSocket, err)
 	}
 	defer func() {
 		lStop = true
@@ -796,15 +529,15 @@ func (resyncPeriod *resync) changeWatcher() (err error) {
 		select {
 		case <-done:
 			// Termination signal received, stop
-			glog.V(2).Infof("changeWatcher done")
+			klog.V(2).Infof("changeWatcher done")
 			if err := tunedStop(nil); err != nil {
-				glog.Errorf("%s", err.Error())
+				klog.Errorf("%s", err.Error())
 			}
 			return nil
 
 		case s := <-sockConns:
 			if s.err != nil {
-				return fmt.Errorf("Connection accept error: %v", err)
+				return fmt.Errorf("connection accept error: %v", err)
 			}
 
 			buf := make([]byte, len("stop"))
@@ -813,61 +546,51 @@ func (resyncPeriod *resync) changeWatcher() (err error) {
 
 			if string(data) == "stop" {
 				if err := tunedStop(&s); err != nil {
-					glog.Errorf("%s", err.Error())
+					klog.Errorf("%s", err.Error())
 				}
 				return nil
 			}
 
 		case <-tunedExit:
 			cmd = nil // cmd.Start() cannot be used more than once
-			return fmt.Errorf("Tuned process exitted")
+			return fmt.Errorf("tuned process exitted")
 
 		case fsEvent := <-wFs.Events:
-			glog.V(2).Infof("fsEvent")
+			klog.V(2).Infof("fsEvent")
 			// Ignore Write and Create events, wait for the removal of the old ConfigMap to trigger reload
 			if fsEvent.Op&fsnotify.Remove == fsnotify.Remove {
-				glog.V(1).Infof("Remove event on: %s", fsEvent.Name)
+				klog.V(1).Infof("remove event on: %s", fsEvent.Name)
 				tuned.change.cfg = true
 			}
 
 		case err := <-wFs.Errors:
-			return fmt.Errorf("Error watching filesystem: %v", err)
-
-		case podEvent, ok := <-wPod.ResultChan():
-			glog.V(2).Infof("wPod.ResultChan()")
-			if !ok {
-				return fmt.Errorf("Pod event watch channel closed.")
-			}
-			podChangeHandler(podEvent, &tuned)
-
-		case <-tickerPull.C:
-			glog.V(2).Infof("tickerPull.C")
-			if err := pullLabels(clientset, &tuned, nodeName); err != nil {
-				return err
-			}
-			if resyncPeriod.now/2 >= resyncPeriod.min {
-				// we've increased the original resyncPeriod due to errors; there was a successful
-				// pull now, converge back to the original resyncPeriod.min value
-				resyncPeriod.now /= 2
-				glog.V(1).Infof("Lowering resyncPeriod to %d", resyncPeriod.now)
-				tickerPull = time.NewTicker(time.Second * time.Duration(resyncPeriod.now))
-			}
+			return fmt.Errorf("error watching filesystem: %v", err)
 
 		case <-tickerReload.C:
-			glog.V(2).Infof("tickerReload.C")
+			klog.V(2).Infof("tickerReload.C")
 			if err := timedTunedReloader(&tuned); err != nil {
 				return err
 			}
 		}
 	}
+
+	return nil
 }
 
 func retryLoop() (err error) {
-	var resyncPeriod resync
-	resyncPeriod.now = pullResyncPeriodWithJitter()
-	resyncPeriod.min = resyncPeriod.now
+	const (
+		errsMax        = 5  // the maximum number of consecutive errors within errsMaxWithinSeconds
+		sleepRetryInit = 10 // the initial retry period [s]
+	)
+	var (
+		errs       int
+		sleepRetry int64 = sleepRetryInit
+		// sum of the series: S_n = x(1)*(q^n-1)/(q-1) + add 60s for each changeWatcher() call
+		errsMaxWithinSeconds int64 = (sleepRetry*int64(math.Pow(2, errsMax)) - sleepRetry) + errsMax*60
+	)
+	errsTimeStart := time.Now().Unix()
 	for {
-		err = resyncPeriod.changeWatcher()
+		err = changeWatcher()
 		if err == nil {
 			break
 		}
@@ -878,18 +601,25 @@ func retryLoop() (err error) {
 		default:
 		}
 
-		glog.Errorf("%s", err.Error())
-		resyncPeriod.now *= 2
-		glog.V(1).Infof("Increasing resyncPeriod to %d", resyncPeriod.now)
-		if resyncPeriod.now > resyncPeriodNodeMax {
-			glog.Errorf("Increased resyncPeriod (%d) beyond the maximum (%d), terminating...", resyncPeriod.now, resyncPeriodNodeMax)
-			break
+		klog.Errorf("%s", err.Error())
+		sleepRetry *= 2
+		klog.V(1).Infof("increased retry period to %d", sleepRetry)
+		if errs++; errs >= errsMax {
+			now := time.Now().Unix()
+			if (now - errsTimeStart) <= errsMaxWithinSeconds {
+				klog.Errorf("seen %d errors in %d seconds (limit was %d), terminating...", errs, now-errsTimeStart, errsMaxWithinSeconds)
+				break
+			}
+			errs = 0
+			sleepRetry = sleepRetryInit
+			errsTimeStart = time.Now().Unix()
+			klog.V(1).Infof("initialized retry period to %d", sleepRetry)
 		}
 
 		select {
 		case <-done:
 			return nil
-		case <-time.After(time.Second * time.Duration(resyncPeriod.now)):
+		case <-time.After(time.Second * time.Duration(sleepRetry)):
 			continue
 		}
 	}
@@ -897,9 +627,7 @@ func retryLoop() (err error) {
 }
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
 	parseCmdOpts()
-	logsCoexist()
 
 	if *boolVersion {
 		fmt.Fprintf(os.Stderr, "%s %s\n", programName, version)

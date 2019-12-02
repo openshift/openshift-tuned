@@ -1,13 +1,9 @@
 #!/bin/sh
 
-cluster_node_labels=${CLUSTER_NODE_LABELS:-/var/lib/tuned/ocp-node-labels.cfg}
-cluster_pod_labels=${CLUSTER_POD_LABELS:-/var/lib/tuned/ocp-pod-labels.cfg}
 openshift_tuned_socket=/var/lib/tuned/openshift-tuned.sock
 export SYSTEMD_IGNORE_CHROOT=1
 
 start() {
-  systemctl disable tuned --now || :
-
   # Tuned can take ~20s to reload/start when "ulimit -Sn == 1048576".
   # See:
   # - https://github.com/redhat-performance/tuned/issues/146
@@ -17,9 +13,6 @@ start() {
 
   openshift-tuned \
     -v=1 \
-    -node-labels $cluster_node_labels \
-    -pod-labels $cluster_pod_labels \
-    -watch-file /etc/tuned/recommend.d/ \
     -watch-file /var/lib/tuned/profiles-data/ \
     ${OCP_NODE_NAME}
 }

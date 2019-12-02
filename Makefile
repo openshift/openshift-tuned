@@ -2,17 +2,21 @@ PACKAGE=github.com/openshift/openshift-tuned
 PACKAGE_BIN=$(lastword $(subst /, ,$(PACKAGE)))
 PACKAGE_SRC=$(wildcard cmd/*.go)
 
-DOCKERFILE=Dockerfile
-IMAGE_TAG=openshift/openshift-tuned
-IMAGE_REGISTRY=quay.io
+# Build-specific variables
+OUT_DIR=_output
 GO=GO111MODULE=on GOFLAGS=-mod=vendor go
 GOFMT_CHECK=$(shell find . -not \( \( -wholename './.*' -o -wholename '*/vendor/*' \) -prune \) -name '*.go' | sort -u | xargs gofmt -s -l)
 REV=$(shell git describe --long --tags --match='v*' --always --dirty)
 
+# Container image-related variables
+DOCKERFILE=Dockerfile
+IMAGE_TAG=openshift/openshift-tuned
+IMAGE_REGISTRY=quay.io
+
 all: $(PACKAGE_BIN)
 
 $(PACKAGE_BIN) build: $(PACKAGE_SRC)
-	$(GO) build -o $(PACKAGE_BIN) -ldflags '-X main.version=$(REV)' $^
+	$(GO) build -o $(OUT_DIR)/$(PACKAGE_BIN) -ldflags '-X main.version=$(REV)' $^
 
 vet: $(PACKAGE_SRC)
 	$(GO) vet -printfuncs=Info,Infof,Warning,Warningf $^
@@ -36,7 +40,7 @@ test:
 
 clean:
 	$(GO) clean
-	rm -f $(PACKAGE_BIN)
+	rm -rf $(OUT_DIR)
 
 local-image:
 ifdef USE_BUILDAH
