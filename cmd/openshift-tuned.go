@@ -36,12 +36,18 @@ import (
 // Types
 type arrayFlags []string
 
+type resync struct {
+	now int64
+	min int64
+}
+
 type tunedState struct {
 	// label2value map
 	nodeLabels map[string]string
 	// namespace/podname -> label2value map
-	podLabels map[string]map[string]string
-	change    struct {
+	podLabels         map[string]map[string]string
+	podLabelsPullTime int64
+	change            struct {
 		// did node labels change?
 		node bool
 		// did pod labels change?
@@ -53,8 +59,9 @@ type tunedState struct {
 
 // Constants
 const (
-	resyncPeriodDefault = 60
-	sleepRetry          = 5
+	resyncPeriodNodeDefault = 60
+	resyncPeriodNodeMax     = 3600     // maximum resync node period due to exponential backoff
+	resyncPeriodPodDefault  = 3600 * 8 // rely on watches and only pull pod labels every resyncPeriodPodDefault [s]
 	// Minimum interval between writing changed node/pod labels for tuned daemon in [s]
 	labelDumpInterval      = 5
 	PNAME                  = "openshift-tuned"
@@ -170,6 +177,10 @@ func getConfig() (*rest.Config, error) {
 	}
 
 	return nil, fmt.Errorf("Could not locate a kubeconfig")
+}
+
+func getJitter(period int64, factor float64) int64 {
+	return rand.Int63n(int64(float64(period)*factor+1)) - int64(float64(period)*factor/2)
 }
 
 func profilesExtract() error {
@@ -528,6 +539,7 @@ func timedTunedReloader(tuned *tunedState) (err error) {
 
 func pullLabels(clientset *kubernetes.Clientset, tuned *tunedState, nodeName string) error {
 	// Resync period elapsed, force-pull node and pod labels
+	glog.V(2).Infof("Pulling node labels")
 	nodeLabels, err := nodeLabelsGet(clientset, nodeName)
 	if err != nil {
 		return err
@@ -537,36 +549,52 @@ func pullLabels(clientset *kubernetes.Clientset, tuned *tunedState, nodeName str
 		tuned.change.node = true
 	}
 
-	podLabels, err := podLabelsGet(clientset, nodeName)
-	if err != nil {
-		return err
+	nowUnix := time.Now().Unix()
+	if nowUnix >= tuned.podLabelsPullTime {
+		glog.V(2).Infof("Pulling pod labels")
+		// Pull for pod labels was done >= resyncPeriodPodDefault
+		podLabels, err := podLabelsGet(clientset, nodeName)
+		if err != nil {
+			return err
+		}
+		tuned.setNextPodLabelsPullTime(nowUnix)
+		if !reflect.DeepEqual(podLabels, tuned.podLabels) {
+			tuned.podLabels = podLabels
+			tuned.change.pod = true
+		}
 	}
-	if !reflect.DeepEqual(podLabels, tuned.podLabels) {
-		tuned.podLabels = podLabels
-		tuned.change.pod = true
-	}
+
 	return nil
 }
 
 func pullResyncPeriod() int64 {
 	var (
 		err                  error
-		resyncPeriodDuration int64 = resyncPeriodDefault
+		resyncPeriodDuration int64 = resyncPeriodNodeDefault
 	)
 	if os.Getenv("RESYNC_PERIOD") != "" {
 		resyncPeriodDuration, err = strconv.ParseInt(os.Getenv("RESYNC_PERIOD"), 10, 64)
 		if err != nil {
-			glog.Errorf("Error: cannot parse RESYNC_PERIOD (%s), using %d", os.Getenv("RESYNC_PERIOD"), resyncPeriodDefault)
-			resyncPeriodDuration = resyncPeriodDefault
+			glog.Errorf("Error: cannot parse RESYNC_PERIOD (%s), using %d", os.Getenv("RESYNC_PERIOD"), resyncPeriodNodeDefault)
+			resyncPeriodDuration = resyncPeriodNodeDefault
 		}
 	}
 
-	// Add some randomness to the resync period, so that we don't end up in a lockstep querying the API server
-	resyncPeriodDuration += rand.Int63n(resyncPeriodDuration/5+1) - resyncPeriodDuration/10
 	return resyncPeriodDuration
 }
 
-func changeWatcher() (err error) {
+func pullResyncPeriodWithJitter() int64 {
+	resyncPeriodDuration := pullResyncPeriod()
+
+	// Add some randomness to the resync period, so that we don't end up in lockstep querying the API server
+	return resyncPeriodDuration + getJitter(resyncPeriodDuration, 0.3)
+}
+
+func (tuned *tunedState) setNextPodLabelsPullTime(secsSinceEpoch int64) {
+	tuned.podLabelsPullTime = secsSinceEpoch + resyncPeriodPodDefault + getJitter(resyncPeriodPodDefault, 0.3) // try to avoid lockstep
+}
+
+func (resyncPeriod *resync) changeWatcher() (err error) {
 	var (
 		tuned tunedState
 		wPod  watch.Interface
@@ -590,12 +618,14 @@ func changeWatcher() (err error) {
 	}
 
 	// Create a ticker to do a full node/pod labels pull
-	resyncPeriod := pullResyncPeriod()
-	tickerPull := time.NewTicker(time.Second * time.Duration(resyncPeriod))
+	tickerPull := time.NewTicker(time.Second * time.Duration(resyncPeriod.now))
 	defer tickerPull.Stop()
-	glog.Infof("Resync period to pull node/pod labels: %d [s]", resyncPeriod)
+	glog.Infof("Resync period to pull node/pod labels: %d [s]", resyncPeriod.now)
 
-	// Pull node and pod labels before entering the loop; node labels would be fetched after resyncPeriod
+	// When the first pod pull should happen; try to avoid lockstep
+	tuned.setNextPodLabelsPullTime(time.Now().Unix())
+
+	// Pull node and pod labels before entering the loop; node labels would otherwise be fetched after resyncPeriod.now
 	if err := pullLabels(clientset, &tuned, nodeName); err != nil {
 		return err
 	}
@@ -654,6 +684,13 @@ func changeWatcher() (err error) {
 			if err := pullLabels(clientset, &tuned, nodeName); err != nil {
 				return err
 			}
+			if resyncPeriod.now/2 >= resyncPeriod.min {
+				// we've increased the original resyncPeriod due to errors; there was a successful
+				// pull now, converge back to the original resyncPeriod.min value
+				resyncPeriod.now /= 2
+				glog.V(1).Infof("Lowering resyncPeriod to %d", resyncPeriod.now)
+				tickerPull = time.NewTicker(time.Second * time.Duration(resyncPeriod.now))
+			}
 
 		case <-tickerReload.C:
 			glog.V(2).Infof("tickerReload.C")
@@ -664,15 +701,12 @@ func changeWatcher() (err error) {
 	}
 }
 
-func retryLoop(f func() error) (err error) {
-	var errs int
-	const (
-		errsMax              = 5
-		errsMaxWithinSeconds = 120
-	)
-	errsTimeStart := time.Now().Unix()
+func retryLoop() (err error) {
+	var resyncPeriod resync
+	resyncPeriod.now = pullResyncPeriodWithJitter()
+	resyncPeriod.min = resyncPeriod.now
 	for {
-		err = f()
+		err = resyncPeriod.changeWatcher()
 		if err == nil {
 			break
 		}
@@ -684,16 +718,19 @@ func retryLoop(f func() error) (err error) {
 		}
 
 		glog.Errorf("%s", err.Error())
-		if errs++; errs >= errsMax {
-			now := time.Now().Unix()
-			if (now - errsTimeStart) <= errsMaxWithinSeconds {
-				glog.Errorf("Seen %d errors in %d seconds, terminating...", errs, now-errsTimeStart)
-				break
-			}
-			errs = 0
-			errsTimeStart = time.Now().Unix()
+		resyncPeriod.now *= 2
+		glog.V(1).Infof("Increasing resyncPeriod to %d", resyncPeriod.now)
+		if resyncPeriod.now > resyncPeriodNodeMax {
+			glog.Errorf("Increased resyncPeriod (%d) beyond the maximum (%d), terminating...", resyncPeriod.now, resyncPeriodNodeMax)
+			break
 		}
-		time.Sleep(time.Second * sleepRetry)
+
+		select {
+		case <-done:
+			return nil
+		case <-time.After(time.Second * time.Duration(resyncPeriod.now)):
+			continue
+		}
 	}
 	return err
 }
@@ -714,7 +751,7 @@ func main() {
 	}
 
 	sigs := signalHandler()
-	err := retryLoop(changeWatcher)
+	err := retryLoop()
 	signal.Stop(sigs)
 	if err != nil {
 		panic(err.Error())
