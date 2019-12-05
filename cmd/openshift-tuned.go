@@ -13,6 +13,7 @@ import (
 	"os/signal"     // signal.Notify()
 	"os/user"       // user.Current()
 	"path/filepath" // filepath.Join()
+	"reflect"       // DeepEqual()
 	"strconv"       // strconv
 	"strings"       // strings.Join()
 	"syscall"       // syscall.SIGHUP, ...
@@ -43,6 +44,8 @@ type tunedState struct {
 	change struct {
 		// did profile change?
 		profile bool
+		// did the "rendered" tuned object change?
+		rendered bool
 		// did tuned profiles/recommend config change on the filesystem?
 		cfg bool
 	}
@@ -61,6 +64,7 @@ const (
 	openshiftTunedRunDir   = "/run/" + programName
 	openshiftTunedPidFile  = openshiftTunedRunDir + "/" + programName + ".pid"
 	openshiftTunedSocket   = "/var/lib/tuned/openshift-tuned.sock"
+	supportCM              = true // remove when dropping support for tuned-profiles ConfigMap
 )
 
 // Global variables
@@ -180,12 +184,15 @@ func disableSystemTuned() {
 	}
 }
 
-func profilesExtract() error {
-	klog.Infof("extracting tuned profiles")
+// This function is for backward-compatibility with older versions of NTO, it will be removed.
+func profilesExtractCM() error {
+	klog.Infof("extracting tuned profiles from %s", tunedProfilesConfigMap)
 
 	tunedProfilesYaml, err := ioutil.ReadFile(tunedProfilesConfigMap)
 	if err != nil {
-		return fmt.Errorf("failed to open tuned profiles ConfigMap file %q: %v", tunedProfilesConfigMap, err)
+		// This error is no longer fatal since we support profiles in the "rendered" Tuned object;
+		// the file may simply not exist when running the latest NTO
+		return nil
 	}
 
 	mProfiles := make(map[string]string)
@@ -212,6 +219,38 @@ func profilesExtract() error {
 			return fmt.Errorf("failed to write tuned profile file %q: %v", profileFile, err)
 		}
 	}
+	return nil
+}
+
+func profilesExtract(profiles []tunedv1.TunedProfile) error {
+	klog.Infof("extracting tuned profiles")
+
+	for index, profile := range profiles {
+		if profile.Name == nil {
+			klog.Warningf("profilesExtract(): profile name missing for profile %v", index)
+			continue
+		}
+		if profile.Data == nil {
+			klog.Warningf("profilesExtract(): profile data missing for profile %v", index)
+			continue
+		}
+		profileDir := fmt.Sprintf("%s/%s", tunedProfilesDir, *profile.Name)
+		profileFile := fmt.Sprintf("%s/%s", profileDir, "tuned.conf")
+
+		if err := mkdir(profileDir); err != nil {
+			return fmt.Errorf("failed to create tuned profile directory %q: %v", profileDir, err)
+		}
+
+		f, err := os.Create(profileFile)
+		if err != nil {
+			return fmt.Errorf("failed to create tuned profile file %q: %v", profileFile, err)
+		}
+		defer f.Close()
+		if _, err = f.WriteString(*profile.Data); err != nil {
+			return fmt.Errorf("failed to write tuned profile file %q: %v", profileFile, err)
+		}
+	}
+
 	return nil
 }
 
@@ -398,18 +437,35 @@ func timedTunedReloader(tuned *tunedState) (err error) {
 			klog.V(1).Infof("active and recommended profile (%s) match; profile change will not trigger profile reload", activeProfile)
 		}
 	}
-	// Check tuned profiles file changes
-	if tuned.change.cfg {
-		tuned.change.cfg = false
-		if err = profilesExtract(); err != nil {
-			return err
-		}
+	if tuned.change.rendered {
+		// The "rendered" tuned object changed
+		tuned.change.rendered = false
 		reload = true
+	}
+
+	// Check tuned profiles file changes
+	if supportCM {
+		// Check tuned profiles file changes
+		if tuned.change.cfg {
+			tuned.change.cfg = false
+			if err = profilesExtractCM(); err != nil {
+				return err
+			}
+			reload = true
+		}
 	}
 	if reload {
 		err = tunedReload()
 	}
 	return err
+}
+
+func getTuned(obj interface{}) (tuned *tunedv1.Tuned, err error) {
+	tuned, ok := obj.(*tunedv1.Tuned)
+	if !ok {
+		return nil, fmt.Errorf("could not convert object to a tuned object: %+v", obj)
+	}
+	return tuned, nil
 }
 
 func getTunedProfile(obj interface{}) (profile *tunedv1.Profile, err error) {
@@ -420,17 +476,125 @@ func getTunedProfile(obj interface{}) (profile *tunedv1.Profile, err error) {
 	return profile, nil
 }
 
+func profileEventHandler(tuned *tunedState) cache.ResourceEventHandlerFuncs {
+	return cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			p, err := getTunedProfile(obj)
+			if err != nil {
+				klog.Errorf("%s", err.Error())
+				return
+			}
+			klog.V(1).Infof("profile %q added, tuned profile requested: %s", p.ObjectMeta.Name, p.Spec.Config.TunedProfile)
+			// When moving this call elsewhere, remember it is undesirable to disable system tuned
+			// on nodes that should not be managed by openshift-tuned
+			disableSystemTuned()
+			err = tunedRecommendFileWrite(p.Spec.Config.TunedProfile)
+			if err != nil {
+				klog.Errorf("%s", err.Error())
+				return
+			}
+			tuned.change.profile = true
+		},
+		UpdateFunc: func(objOld, objNew interface{}) {
+			pNew, err := getTunedProfile(objNew)
+			if err != nil {
+				klog.Errorf("%s", err.Error())
+				return
+			}
+			pOld, err := getTunedProfile(objOld)
+			if err != nil {
+				klog.Errorf("%s", err.Error())
+				return
+			}
+			if pNew.Spec.Config.TunedProfile == pOld.Spec.Config.TunedProfile {
+				return
+			}
+			klog.V(1).Infof("profile %q changed, tuned profile requested: %s", pNew.ObjectMeta.Name, pNew.Spec.Config.TunedProfile)
+			err = tunedRecommendFileWrite(pNew.Spec.Config.TunedProfile)
+			if err != nil {
+				klog.Errorf("%s", err.Error())
+				return
+			}
+			tuned.change.profile = true
+		},
+		DeleteFunc: func(obj interface{}) {
+			p, err := getTunedProfile(obj)
+			if err != nil {
+				klog.Errorf("%s", err.Error())
+				return
+			}
+			klog.V(1).Infof("profile %q deleted, keeping the old tuned profile: %s", p.ObjectMeta.Name, p.Spec.Config.TunedProfile)
+		},
+	}
+}
+
+func tunedEventHandler(tuned *tunedState) cache.ResourceEventHandlerFuncs {
+	return cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			t, err := getTuned(obj)
+			if err != nil {
+				klog.Errorf("%s", err.Error())
+				return
+			}
+			klog.V(1).Infof("tuned %q added", t.ObjectMeta.Name)
+			err = profilesExtract(t.Spec.Profile)
+			if err != nil {
+				klog.Errorf("%s", err.Error())
+				return
+			}
+			tuned.change.rendered = true
+		},
+		UpdateFunc: func(objOld, objNew interface{}) {
+			tNew, err := getTuned(objNew)
+			if err != nil {
+				klog.Errorf("%s", err.Error())
+				return
+			}
+			tOld, err := getTuned(objOld)
+			if err != nil {
+				klog.Errorf("%s", err.Error())
+				return
+			}
+			// TODO: after merging the operator and operand repos, do not check for equality
+			// and extract the profiles here; just enqueue the change and get the new object
+			// from cache
+			if reflect.DeepEqual(tNew.Spec.Profile, tOld.Spec.Profile) {
+				// Profiles in the cluster-wide "rendered" Tuned CR did not change
+				return
+			}
+			klog.V(1).Infof("tuned %q changed", tNew.ObjectMeta.Name)
+			err = profilesExtract(tNew.Spec.Profile)
+			if err != nil {
+				klog.Errorf("%s", err.Error())
+				return
+			}
+			tuned.change.rendered = true
+		},
+		DeleteFunc: func(obj interface{}) {
+			t, err := getTuned(obj)
+			if err != nil {
+				klog.Errorf("%s", err.Error())
+				return
+			}
+			klog.V(1).Infof("tuned %q deleted, keeping the old tuned profile", t.ObjectMeta.Name)
+		},
+	}
+}
+
 func changeWatcher() (err error) {
 	var (
-		tuned         tunedState
-		lStop         bool
-		nodeName      string          = flag.Args()[0]
-		fieldSelector fields.Selector = fields.SelectorFromSet(fields.Set{"metadata.name": nodeName})
+		tuned     tunedState
+		lStop     bool
+		nodeName  string          = flag.Args()[0]
+		profileFS fields.Selector = fields.SelectorFromSet(fields.Set{"metadata.name": nodeName})
+		tunedFS   fields.Selector = fields.SelectorFromSet(fields.Set{"metadata.name": tunedv1.TunedRenderedResourceName})
 	)
 
-	err = profilesExtract()
-	if err != nil {
-		return err
+	if supportCM {
+		err = profilesExtractCM()
+		if err != nil {
+			return err
+		}
 	}
 
 	kubeConfig, err := getConfig()
@@ -444,45 +608,19 @@ func changeWatcher() (err error) {
 	}
 
 	// Perform an initial list and start a watch on Profiles in operand namespace
-	profileLW := cache.NewListWatchFromClient(cs.TunedV1().RESTClient(), "Profiles", operandNamespace, fieldSelector)
-
-	si := cache.NewSharedInformer(profileLW, &tunedv1.Profile{}, 0)
-	si.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
-			profile, err := getTunedProfile(obj)
-			if err != nil {
-				klog.Errorf("%s", err.Error())
-				return
-			}
-			klog.V(1).Infof("profile %q added, tuned profile requested: %s", profile.ObjectMeta.Name, profile.Spec.Config.TunedProfile)
-			disableSystemTuned() // When moving this call elsewhere, remember it is undesirable to disable system tuned
-			// on nodes that should not be handled by openshift-tuned
-			tunedRecommendFileWrite(profile.Spec.Config.TunedProfile)
-			tuned.change.profile = true
-		},
-		DeleteFunc: func(obj interface{}) {
-			profile, err := getTunedProfile(obj)
-			if err != nil {
-				klog.Errorf("%s", err.Error())
-				return
-			}
-			klog.V(1).Infof("profile %q deleted, keeping the old tuned profile: %s", profile.ObjectMeta.Name, profile.Spec.Config.TunedProfile)
-		},
-		UpdateFunc: func(oldObj, newObj interface{}) {
-			profile, err := getTunedProfile(newObj)
-			if err != nil {
-				klog.Errorf("%s", err.Error())
-				return
-			}
-			klog.V(1).Infof("profile %q changed, tuned profile requested: %s", profile.ObjectMeta.Name, profile.Spec.Config.TunedProfile)
-			tunedRecommendFileWrite(profile.Spec.Config.TunedProfile)
-			tuned.change.profile = true
-		},
-	})
+	profileLW := cache.NewListWatchFromClient(cs.TunedV1().RESTClient(), "Profiles", operandNamespace, profileFS)
+	tunedLW := cache.NewListWatchFromClient(cs.TunedV1().RESTClient(), "Tuneds", operandNamespace, tunedFS)
 
 	stop := make(chan struct{})
 	defer close(stop)
-	go si.Run(stop)
+
+	siProfile := cache.NewSharedInformer(profileLW, &tunedv1.Profile{}, 0)
+	siProfile.AddEventHandler(profileEventHandler(&tuned))
+	go siProfile.Run(stop)
+
+	siTuned := cache.NewSharedInformer(tunedLW, &tunedv1.Tuned{}, 0)
+	siTuned.AddEventHandler(tunedEventHandler(&tuned))
+	go siTuned.Run(stop)
 
 	// Create a ticker to extract new profiles and possibly reload tuned;
 	// this also rate-limits reloads to a maximum of profileExtractInterval reloads/s
