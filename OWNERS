@@ -7,3 +7,4 @@ reviewers:
   - jmencak
   - sjug
   - zvonkok
+component: "Node Tuning Operator"
